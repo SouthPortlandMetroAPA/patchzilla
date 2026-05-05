@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.03'
+  APP_VERSION = '2.04'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -352,9 +352,9 @@ DEPENDENCIES
 <div id="tabsBar" class="tabs-bar hidden">
   <div class="container">
     <div class="tab-row">
-      <button class="tab active" data-tab="profile">Profile &amp; Art</button>
+      <button class="tab" data-tab="profile">Profile &amp; Art</button>
       <button class="tab" data-tab="contacts">Mailing Contacts</button>
-      <button class="tab" data-tab="slips">Slips &amp; Envelopes</button>
+      <button class="tab active" data-tab="slips">Slips &amp; Envelopes</button>
     </div>
   </div>
 </div>
@@ -381,7 +381,7 @@ DEPENDENCIES
     <!-- ════════════════════════════════════════════════════════════════
          TAB 1: Profile & Art
          ════════════════════════════════════════════════════════════════ -->
-    <div class="panel active" id="panel-profile">
+    <div class="panel" id="panel-profile">
 
       <div class="card">
         <h2>League info</h2>
@@ -525,7 +525,7 @@ DEPENDENCIES
     <!-- ════════════════════════════════════════════════════════════════
          TAB 3: Slips & Envelopes
          ════════════════════════════════════════════════════════════════ -->
-    <div class="panel" id="panel-slips">
+    <div class="panel active" id="panel-slips">
 
       <div class="card">
         <h2>Paste SP log</h2>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.03';
+const APP_VERSION = '2.04';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -1789,7 +1789,7 @@ function printEnvelopes(isTest) {
 const TAB_LABELS = { profile: 'Profile & Art', contacts: 'Mailing Contacts', slips: 'Slips & Envelopes' };
 
 function switchTab(name) {
-  if (!TAB_LABELS[name]) name = 'profile';
+  if (!TAB_LABELS[name]) name = 'slips';
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
 }
