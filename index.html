@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.01'
+  APP_VERSION = '2.02'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.01';
+const APP_VERSION = '2.02';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -1667,8 +1667,8 @@ function _buildSlipHTML(pages, isTest) {
   h += '.award-single .award-box { font-size: 9px; padding: 3px 12px; letter-spacing: 1.5px; }';
   h += '.slip-footer { display: flex; align-items: center; gap: 6px; margin-top: 0; width: 60%; }';
   h += '.slip-footer-line { flex: 1; height: 1px; background: #000; }';
-  h += '.slip-footer-text { font-size: 8px; font-style: italic; white-space: nowrap; }';
-  h += '.slip-sub { font-size: 7px; color: #444; letter-spacing: 0.5px; }';
+  h += '.slip-footer-text { font-size: 9px; font-style: italic; white-space: nowrap; font-family: "Palatino Linotype", Palatino, Georgia, serif; }';
+  h += '.slip-sub { font-size: 9px; color: #444; letter-spacing: 0.5px; font-family: "Palatino Linotype", Palatino, Georgia, serif; }';
   if (isTest) h += '.test-banner { background: #000; color: #fff; text-align: center; font-size: 10px; font-weight: 700; padding: 3px; letter-spacing: 2px; text-transform: uppercase; }';
   h += '</style></head><body>';
 
