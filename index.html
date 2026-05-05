@@ -1,0 +1,1837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PatchZilla</title>
+<!--
+═══════════════════════════════════════════════════════════════════════════
+PatchZilla v2 — site/index.html
+═══════════════════════════════════════════════════════════════════════════
+
+PURPOSE
+  Multi-tenant standalone slip & envelope generator for ANY APA league
+  operator. Each operator has a slug (?op=<slug>) and configures their
+  own profile, art, and mailing contacts. PatchZilla v2 is a faithful
+  port of the legacy GAS-based PatchZilla, with:
+    - Backend swapped from Google Sheets → Supabase (schema: patchzilla)
+    - Hosting moved from GAS doGet → GitHub Pages (Facebook in-app safe)
+    - NEW mailing-contacts flow: paste a team list + a full player export,
+      auto-join captains to player rows, hard-error on any miss, then
+      replace the entire mailing_contacts table for that operator.
+    - Slip + envelope print layouts preserved 1:1 with the old app.
+
+VERSION
+  APP_VERSION = '2.00'
+
+DEPLOYMENT
+  GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
+  Cloudflare     : not used (writes go straight to Supabase REST)
+  Auto-update    : polls apa_core.apps?app_name=eq.PatchZilla every 30s,
+                   shows update overlay + reloads when version mismatches.
+
+URL PATTERN
+  ?op=<slug>      — load that operator's profile + contacts
+  (no op param)   — show key-gate listing existing operators
+
+TENANT MODEL
+  - No login, no auth. anon JWT only.
+  - The slug IS the tenant key. Knowledge of the slug grants full edit
+    access to that operator's data. (Same trust model as legacy GAS app
+    where anyone with the script URL could write.)
+  - Unknown slug → offer "Create operator: <slug>" button.
+
+SCHEMA (already deployed in Supabase project spm-apa, schema patchzilla)
+  patchzilla.operators
+    slug PK, display_name, return_name, return_address, return_city,
+    return_state, return_zip, patch_mode ('per_occurrence'|'per_type'),
+    art JSONB { slip_left, slip_right, env_left, env_right } (public URLs),
+    team_paste_at TIMESTAMPTZ, players_paste_at TIMESTAMPTZ, timestamps
+  patchzilla.mailing_contacts
+    id, operator_slug, team_number, team_name, captain_name,
+    co_captain_name (nullable), address1, address2 (nullable),
+    city, state, zip
+  Storage bucket: 'patchzilla' (public read, anon write)
+    Path convention: <slug>/<slot>.<ext>  e.g.  spm/slip_left.png
+
+SECTIONS OF THIS FILE
+  1.  <style>            — :root tokens, header, tabs, cards, forms,
+                           freshness boxes, art grid, contacts table.
+  2.  Header + key gate  — operator picker / create-operator gate.
+  3.  Tab 1 (Profile)    — league name, return address, patch mode, 4 art slots.
+  4.  Tab 2 (Contacts)   — freshness boxes, two paste areas, generate button,
+                           saved contacts table.
+  5.  Tab 3 (Slips/Env)  — SP log paste, parse, preview cards, print buttons.
+  6.  <script>
+        - Constants (Supabase URL/anon key, schema, versions)
+        - sb(method, path, body) helper (PostgREST) +
+          uploadStorage(path, blob) + storagePublicUrl(path)
+        - Auto-update version-check + pollForDeploy
+        - Operator load / create / persist
+        - Profile fields autosave on change
+        - Art upload/delete (Storage + operators.art JSONB patch)
+        - Team-list parser + All-Players parser + Generate flow
+        - SP log parser (header-aware, per_type/per_occurrence aware)
+        - Slip print HTML builder (5 per Letter, certificate layout)
+        - Envelope print HTML builder (#10, return + recipient + art)
+
+DEPENDENCIES
+  No external runtime libs. Vanilla JS, single self-contained file.
+  Targets Supabase REST + Storage with the anon JWT.
+═══════════════════════════════════════════════════════════════════════════
+-->
+<style>
+  /* ════════════════════════════════════════════════════════════════════
+     Color tokens + base styling — borrowed directly from OnTheFelt admin
+     so the operator's tooling looks/feels like one consistent admin
+     surface across apps. Dark theme; SPM red+blue gradient header.
+     ════════════════════════════════════════════════════════════════════ */
+  :root {
+    --spm-primary: #ea002a;
+    --spm-accent:  #0031a1;
+    --bg:          #0e1116;
+    --bg-elev:     #161b24;
+    --card:        #1c2230;
+    --border:      #2a3142;
+    --text:        #e7ecf2;
+    --text-dim:    #98a2b3;
+    --muted:       #6c7689;
+    --success:     #16a34a;
+    --warn:        #f59e0b;
+    --danger:      #dc2626;
+    --radius:      14px;
+    --pill:        999px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+  .container { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+
+  .header {
+    background: linear-gradient(135deg, var(--spm-primary), var(--spm-accent));
+    color: #fff; padding: 16px 0; position: relative;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.5);
+  }
+  .header h1 {
+    font-size: 1.4rem; font-weight: 900;
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .header h1 .brand-dot {
+    width: 11px; height: 11px; border-radius: 50%;
+    background: #fff; box-shadow: 0 0 0 4px rgba(255,255,255,0.22);
+  }
+  .header h1 .subpage { font-size: 1rem; font-weight: 500; font-style: italic; opacity: 0.85; margin-left: 6px; }
+  .op-badge {
+    position: absolute; top: 18px; right: 16px;
+    padding: 4px 12px; border-radius: var(--pill);
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    background: rgba(255,255,255,0.18); border: 1.5px solid rgba(255,255,255,0.5); color: #fff;
+  }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px; margin: 16px 0;
+  }
+  .card h2 {
+    font-size: 0.85rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--text-dim); margin-bottom: 14px;
+  }
+
+  .form-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .form-row > div { flex: 1; min-width: 140px; }
+  label {
+    display: block; font-size: 0.7rem; font-weight: 700;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em;
+    margin-bottom: 4px;
+  }
+  input, select, textarea {
+    width: 100%; background: var(--bg-elev);
+    color: var(--text); border: 1.5px solid var(--border);
+    border-radius: 10px; padding: 9px 11px;
+    font-size: 0.92rem; font-family: inherit;
+  }
+  textarea { min-height: 110px; resize: vertical; font-family: 'Consolas','Courier New',monospace; font-size: 0.82rem; }
+  input::placeholder, textarea::placeholder { color: var(--muted); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--spm-accent); box-shadow: 0 0 0 3px rgba(0,49,161,0.25); }
+
+  .btn {
+    padding: 9px 18px; border-radius: var(--pill);
+    font-size: 0.82rem; font-weight: 800; border: 0; cursor: pointer;
+    font-family: inherit;
+  }
+  .btn-primary { background: var(--spm-accent); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #0046cc; }
+  .btn-primary:disabled { background: #333; color: var(--muted); cursor: not-allowed; }
+  .btn-outline { background: transparent; border: 1.5px solid var(--border); color: var(--text); }
+  .btn-outline:hover:not(:disabled) { background: rgba(255,255,255,0.04); border-color: var(--text-dim); }
+  .btn-danger  { background: var(--danger); color: #fff; }
+  .btn-success { background: var(--success); color: #fff; }
+  .btn-sm { padding: 5px 12px; font-size: 0.72rem; }
+
+  .table-wrap { overflow-x: auto; }
+  .table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  .table th {
+    text-align: left; padding: 10px 8px; border-bottom: 2px solid var(--border);
+    color: var(--text-dim); font-weight: 700;
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .table td { padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .table tr:hover td { background: rgba(255,255,255,0.02); }
+  .empty { color: var(--text-dim); font-size: 0.85rem; padding: 12px 0; font-style: italic; }
+  .hint { font-size: 0.82rem; color: var(--text-dim); line-height: 1.5; }
+
+  .status-line {
+    padding: 9px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 600;
+    margin-bottom: 12px; display: none;
+  }
+  .status-line.shown { display: block; }
+  .status-line.ok    { background: rgba(22,163,74,0.16); color: var(--success); border: 1px solid rgba(22,163,74,0.3); }
+  .status-line.err   { background: rgba(220,38,38,0.16); color: #fca5a5; border: 1px solid rgba(220,38,38,0.3); }
+  .status-line.warn  { background: rgba(245,158,11,0.16); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
+
+  .key-gate { text-align: center; padding: 60px 20px; }
+  .key-gate .card { max-width: 560px; margin: 0 auto; text-align: left; }
+  code { background: var(--bg-elev); padding: 2px 8px; border-radius: 4px; font-size: 0.85em; color: var(--text); border: 1px solid var(--border); }
+
+  .update-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.78); z-index: 9999; display: none; align-items: center; justify-content: center; padding: 24px; }
+  .update-overlay.shown { display: flex; }
+  .update-box { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; max-width: 380px; text-align: center; }
+  .update-spinner { width: 44px; height: 44px; margin: 0 auto 14px; border-radius: 50%; border: 4px solid rgba(0,49,161,0.25); border-top-color: var(--spm-accent); animation: spin 0.85s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hidden { display: none !important; }
+
+  /* ── Tab bar (3 tabs) ── */
+  .tabs-bar { background: var(--bg-elev); border-bottom: 1px solid var(--border); margin-top: -1px; }
+  .tabs-bar .container { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .tabs-bar .container::-webkit-scrollbar { display: none; }
+  .tab-row { display: inline-flex; gap: 4px; padding: 8px 0; }
+  .tab {
+    background: transparent; color: var(--text-dim); border: 0;
+    padding: 8px 18px; border-radius: var(--pill);
+    font-size: 0.88rem; font-weight: 700; cursor: pointer;
+    white-space: nowrap; font-family: inherit;
+    transition: background 0.15s, color 0.15s;
+  }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  .tab.active { color: #fff; background: var(--spm-accent); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── Art slot grid (Profile tab) ── */
+  .art-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (min-width: 720px) { .art-grid { grid-template-columns: repeat(4, 1fr); } }
+  .art-slot {
+    background: var(--bg-elev); border: 2px dashed var(--border);
+    border-radius: 12px; padding: 12px; text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+  }
+  .art-slot.has-art { border-style: solid; border-color: var(--success); }
+  .art-label { font-size: 0.7rem; font-weight: 800; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+  .art-thumb {
+    width: 100%; height: 90px; background: #fff;
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  .art-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .art-thumb .empty-art { color: var(--muted); font-size: 0.78rem; font-style: italic; }
+  .art-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+  .art-slot input[type="file"] { display: none; }
+  .art-upload-btn {
+    cursor: pointer;
+    padding: 5px 12px; font-size: 0.72rem; font-weight: 800;
+    border-radius: var(--pill); background: var(--spm-accent); color: #fff;
+    display: inline-block;
+  }
+  .art-upload-btn:hover { background: #0046cc; }
+
+  /* ── Freshness boxes (Contacts tab) ── */
+  .fresh-row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 720px) { .fresh-row { grid-template-columns: 1fr 1fr; } }
+  .fresh-box {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .fresh-dot {
+    width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.06);
+  }
+  .fresh-dot.green  { background: var(--success); }
+  .fresh-dot.yellow { background: var(--warn); }
+  .fresh-dot.red    { background: var(--danger); }
+  .fresh-dot.gray   { background: #4a5366; }
+  .fresh-text { display: flex; flex-direction: column; gap: 2px; }
+  .fresh-title { font-size: 0.8rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text); }
+  .fresh-when  { font-size: 0.78rem; color: var(--text-dim); }
+
+  .paste-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 900px) { .paste-grid { grid-template-columns: 1fr 1fr; } }
+  .paste-card .stats { font-size: 0.78rem; color: var(--text-dim); margin-top: 6px; min-height: 1.2em; }
+
+  /* ── Unmatched-captain panel (red) ── */
+  .unmatched-panel {
+    background: rgba(220,38,38,0.10); border: 1.5px solid rgba(220,38,38,0.45);
+    border-radius: 12px; padding: 14px 16px; margin-top: 14px;
+  }
+  .unmatched-panel h3 {
+    font-size: 0.85rem; font-weight: 800; color: #fca5a5;
+    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
+  }
+  .unmatched-panel ul { list-style: none; padding: 0; margin: 0; }
+  .unmatched-panel li { padding: 4px 0; font-size: 0.85rem; color: var(--text); border-bottom: 1px dashed rgba(255,255,255,0.06); }
+  .unmatched-panel li:last-child { border-bottom: none; }
+  .unmatched-panel li strong { color: #fca5a5; }
+
+  /* ── Slips-tab summary bar + envelope cards ── */
+  .summary-bar { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .summary-item {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 16px; flex: 1; min-width: 110px; text-align: center;
+  }
+  .summary-val { font-size: 1.4rem; font-weight: 900; color: var(--spm-accent); }
+  .summary-lbl { font-size: 0.7rem; color: var(--text-dim); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+
+  .env-card {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-left: 4px solid var(--spm-accent);
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 10px;
+  }
+  .env-header { font-size: 0.95rem; font-weight: 800; margin-bottom: 4px; }
+  .env-addr { font-size: 0.78rem; color: var(--text-dim); margin-bottom: 8px; }
+  .env-slip {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 0.85rem;
+  }
+  .env-slip:last-child { border-bottom: none; }
+  .env-slip-name { font-weight: 700; }
+  .env-slip-awards { color: var(--text-dim); font-size: 0.78rem; text-align: right; }
+  .env-meta { font-size: 0.72rem; color: var(--muted); margin-top: 8px; }
+
+  .stat-badge {
+    display: inline-block; background: var(--bg-elev);
+    border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: var(--pill); padding: 3px 10px;
+    font-size: 0.72rem; font-weight: 700; margin-right: 6px;
+  }
+  .stat-badge.good { background: rgba(22,163,74,0.18); color: #86efac; border-color: rgba(22,163,74,0.3); }
+  .stat-badge.warn { background: rgba(245,158,11,0.18); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+  .stat-badge.err  { background: rgba(220,38,38,0.18); color: #fca5a5; border-color: rgba(220,38,38,0.3); }
+
+  /* ── Inventory grid (Slips tab) ── */
+  .inv-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .inv-item {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 14px;
+    font-size: 0.75rem; font-weight: 700; text-align: center; min-width: 110px;
+  }
+  .inv-count { display: block; font-size: 1.1rem; color: var(--spm-primary); font-weight: 900; }
+</style>
+</head>
+<body>
+
+<div class="update-overlay" id="updateOverlay">
+  <div class="update-box">
+    <div class="update-spinner"></div>
+    <div style="font-weight:800;margin-bottom:4px">Updating</div>
+    <div style="color:var(--text-dim);font-size:0.85rem">A new version is being deployed&hellip;</div>
+  </div>
+</div>
+
+<div class="header">
+  <div class="container">
+    <div class="op-badge" id="opBadge">PATCHZILLA v2</div>
+    <h1><span class="brand-dot"></span>PatchZilla <span class="subpage" id="appSubpage"></span></h1>
+  </div>
+</div>
+
+<div id="tabsBar" class="tabs-bar hidden">
+  <div class="container">
+    <div class="tab-row">
+      <button class="tab active" data-tab="profile">Profile &amp; Art</button>
+      <button class="tab" data-tab="contacts">Mailing Contacts</button>
+      <button class="tab" data-tab="slips">Slips &amp; Envelopes</button>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- ════════════════════════════════════════════════════════════════
+       KEY GATE — shown when ?op=<slug> is missing or unknown
+       ════════════════════════════════════════════════════════════════ -->
+  <div id="keyGate" class="key-gate hidden">
+    <div class="card">
+      <h2 id="keyGateTitle">Operator required</h2>
+      <p class="hint" id="keyGateMsg">
+        Append <code>?op=&lt;your-slug&gt;</code> to the URL to enter,
+        or pick an existing operator below.
+      </p>
+      <div id="opPickerWrap" style="margin-top:14px"></div>
+      <div id="createOpWrap" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <div id="appMain" class="hidden">
+
+    <!-- ════════════════════════════════════════════════════════════════
+         TAB 1: Profile & Art
+         ════════════════════════════════════════════════════════════════ -->
+    <div class="panel active" id="panel-profile">
+
+      <div class="card">
+        <h2>League info</h2>
+        <div class="form-row">
+          <div style="flex:2">
+            <label for="profDisplayName">League name (shown on slips)</label>
+            <input type="text" id="profDisplayName" placeholder="e.g. South Portland Metro APA">
+          </div>
+          <div style="flex:1; min-width: 220px">
+            <label for="profPatchMode">Patch mode</label>
+            <select id="profPatchMode">
+              <option value="per_occurrence">Per occurrence (count column = N patches)</option>
+              <option value="per_type">Per type (count column = 1 patch)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Return address (for envelopes)</h2>
+        <div class="form-row">
+          <div style="flex:2">
+            <label for="profReturnName">Name / organization</label>
+            <input type="text" id="profReturnName" placeholder="e.g. APA Midwest Oregon">
+          </div>
+        </div>
+        <div class="form-row" style="margin-top:8px">
+          <div style="flex:3">
+            <label for="profReturnAddress">Street address</label>
+            <input type="text" id="profReturnAddress" placeholder="e.g. 123 Main St">
+          </div>
+        </div>
+        <div class="form-row" style="margin-top:8px">
+          <div style="flex:2">
+            <label for="profReturnCity">City</label>
+            <input type="text" id="profReturnCity">
+          </div>
+          <div style="flex:0 0 90px">
+            <label for="profReturnState">State</label>
+            <input type="text" id="profReturnState" maxlength="2" style="text-transform:uppercase">
+          </div>
+          <div style="flex:0 0 130px">
+            <label for="profReturnZip">Zip</label>
+            <input type="text" id="profReturnZip" maxlength="10">
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
+          <button class="btn btn-primary" id="profileSaveBtn" onclick="saveProfile()">Save profile</button>
+          <span id="profileStatus" class="status-line" style="margin:0"></span>
+        </div>
+        <p class="hint" style="margin-top:8px">Patch-mode + league-name autosave on change. Address fields save when you click Save (so you can finish typing first).</p>
+      </div>
+
+      <div class="card">
+        <h2>Custom art</h2>
+        <p class="hint" style="margin-bottom:10px">PNG or JPG, ideally under 500&nbsp;KB. Files are uploaded to the
+          <code>patchzilla</code> Storage bucket and referenced by public URL.</p>
+        <div class="art-grid" id="artGrid"></div>
+      </div>
+
+    </div><!-- /panel-profile -->
+
+    <!-- ════════════════════════════════════════════════════════════════
+         TAB 2: Mailing Contacts
+         ════════════════════════════════════════════════════════════════ -->
+    <div class="panel" id="panel-contacts">
+
+      <div class="card">
+        <h2>Last paste</h2>
+        <div class="fresh-row">
+          <div class="fresh-box">
+            <span class="fresh-dot gray" id="freshTeamDot"></span>
+            <div class="fresh-text">
+              <span class="fresh-title">Team list</span>
+              <span class="fresh-when" id="freshTeamWhen">Never uploaded</span>
+            </div>
+          </div>
+          <div class="fresh-box">
+            <span class="fresh-dot gray" id="freshPlayerDot"></span>
+            <div class="fresh-text">
+              <span class="fresh-title">All players</span>
+              <span class="fresh-when" id="freshPlayerWhen">Never uploaded</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Paste &amp; parse</h2>
+        <p class="hint" style="margin-bottom:10px">
+          Paste both lists, hit each Parse button, then <strong>Generate Mailing Contacts</strong> below
+          to join captains to player addresses and replace the saved contacts.
+        </p>
+        <div class="paste-grid">
+          <div class="paste-card">
+            <label for="teamPaste">Team list — <em>team#, team name, captain, [co-captain]</em></label>
+            <textarea id="teamPaste" placeholder="5012&#9;Iron Lung&#9;Smith, John&#9;Doe, Jane"></textarea>
+            <div class="stats" id="teamStats"></div>
+            <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="parseTeamList()">Parse team list</button>
+          </div>
+          <div class="paste-card">
+            <label for="playerPaste">All players — <em>apa#, name, addr1, addr2, city, state, zip</em></label>
+            <textarea id="playerPaste" placeholder="12345678&#9;Smith, John&#9;123 Main St&#9;&#9;Portland&#9;ME&#9;04101"></textarea>
+            <div class="stats" id="playerStats"></div>
+            <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="parsePlayerList()">Parse all players</button>
+          </div>
+        </div>
+
+        <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary" id="generateBtn" onclick="generateMailingContacts()" disabled>
+            Generate mailing contacts
+          </button>
+          <span id="generateStatus" class="status-line" style="margin:0"></span>
+        </div>
+
+        <div id="unmatchedWrap"></div>
+      </div>
+
+      <div class="card">
+        <h2>Saved mailing contacts <span id="savedCount" class="hint" style="margin-left:8px"></span></h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width:80px">Team</th>
+                <th>Team name</th>
+                <th>Captain</th>
+                <th>Address</th>
+                <th>City</th>
+                <th style="width:50px">State</th>
+                <th style="width:90px">Zip</th>
+              </tr>
+            </thead>
+            <tbody id="savedBody"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div><!-- /panel-contacts -->
+
+    <!-- ════════════════════════════════════════════════════════════════
+         TAB 3: Slips & Envelopes
+         ════════════════════════════════════════════════════════════════ -->
+    <div class="panel" id="panel-slips">
+
+      <div class="card">
+        <h2>Paste SP log</h2>
+        <p class="hint" style="margin-bottom:10px">
+          Tab-separated. Columns: Mailed | Date/WK | Member# | Name | Team# |
+          [SP columns…] | Rec'd. Rows marked <code>Yes</code> in Mailed are skipped.
+          Output regenerates as you paste.
+        </p>
+        <textarea id="spPaste" rows="6" placeholder="Paste SP log here…"></textarea>
+        <div id="spStats" style="margin-top:8px"></div>
+      </div>
+
+      <div id="warningsCard"></div>
+
+      <div id="outputSummary" class="summary-bar"></div>
+
+      <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary" onclick="printSlips(false)" id="printSlipsBtn" disabled>Print slips</button>
+        <button class="btn btn-primary" onclick="printEnvelopes(false)" id="printEnvBtn" disabled>Print envelopes</button>
+        <button class="btn btn-outline btn-sm" onclick="printSlips(true)">Test slip</button>
+        <button class="btn btn-outline btn-sm" onclick="printEnvelopes(true)">Test envelope</button>
+      </div>
+
+      <div class="card hidden" id="patchInventoryCard">
+        <h2>Patch inventory</h2>
+        <div id="invGrid" class="inv-grid"></div>
+      </div>
+
+      <div id="envelopeList"></div>
+
+    </div><!-- /panel-slips -->
+
+  </div><!-- /appMain -->
+</div><!-- /container -->
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════
+   CONSTANTS
+   ════════════════════════════════════════════════════════════════════════ */
+const APP_NAME    = 'PatchZilla';
+const APP_VERSION = '2.00';
+
+const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
+const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
+const SCHEMA  = 'patchzilla';
+const BUCKET  = 'patchzilla';
+
+// Header sets — apa_core is its own schema for the version-poll table.
+const HEADERS_READ  = { apikey: SB_ANON, Authorization: 'Bearer ' + SB_ANON, 'Accept-Profile': SCHEMA };
+const HEADERS_WRITE = { ...HEADERS_READ, 'Content-Type': 'application/json', 'Content-Profile': SCHEMA, Prefer: 'return=representation' };
+const HEADERS_APA   = { apikey: SB_ANON, Authorization: 'Bearer ' + SB_ANON, 'Accept-Profile': 'apa_core' };
+
+// SP-print layout constants — mirror legacy PatchZilla.
+const SLIPS_PER_PAGE = 5;
+const MAX_PATCHES_PER_ENVELOPE = 8;
+
+// Operator slug from URL — single source of truth for the tenant.
+const params = new URLSearchParams(location.search);
+const OP_SLUG_RAW = (params.get('op') || '').trim().toLowerCase();
+// Normalize: only [a-z0-9-_], strip everything else. Prevents creating
+// operators with whitespace/punctuation in the PK by accident.
+const OP_SLUG = OP_SLUG_RAW.replace(/[^a-z0-9_-]/g, '');
+
+/* ════════════════════════════════════════════════════════════════════════
+   STATE
+   ════════════════════════════════════════════════════════════════════════ */
+let _operator = null;       // operators row (current tenant)
+let _versionMismatch = false;
+
+// Tab 2 (Contacts) parse state
+let _teamRows   = [];       // [{ team_number, team_name, captain_name, co_captain_name }]
+let _playerRows = [];       // [{ apa_number, name, address1, address2, city, state, zip, _key }]
+let _savedContacts = [];    // mailing_contacts rows from server
+
+// Tab 3 (Slips) parse state — populated from spPaste textarea
+let _spData     = [];       // [{ dateWk, memberNum, name, teamNum, awards[] }]
+let _spHeaders  = [];       // [{ index, name }]
+let _envelopes  = [];       // grouped output for print/preview
+
+/* ════════════════════════════════════════════════════════════════════════
+   GENERIC HELPERS
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* esc(s) — HTML-escape a string for safe insertion. Anything user-supplied
+ * (operator names, captain names, addresses, etc.) MUST go through this. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/* setStatus(id, msg, kind) — flash a status line on a form. Auto-clears
+ * after 3.5s. kind ∈ 'ok' | 'err' | 'warn'. */
+function setStatus(id, msg, kind) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'status-line shown ' + (kind || '');
+  el.textContent = msg;
+  if (kind !== 'err') {
+    setTimeout(() => { el.className = 'status-line'; }, 3500);
+  }
+}
+
+/* fmtAge(iso) — render a "2 hours ago" / "5 days ago" string for the
+ * freshness boxes. iso may be null/undefined → returns 'Never uploaded'. */
+function fmtAge(iso) {
+  if (!iso) return 'Never uploaded';
+  const then = new Date(iso).getTime();
+  const ms = Date.now() - then;
+  if (ms < 0) return 'Just now';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60)        return sec + 's ago';
+  const min = Math.floor(sec / 60);
+  if (min < 60)        return min + ' min ago';
+  const hr = Math.floor(min / 60);
+  if (hr < 24)         return hr + ' hour' + (hr === 1 ? '' : 's') + ' ago';
+  const day = Math.floor(hr / 24);
+  if (day < 60)        return day + ' day' + (day === 1 ? '' : 's') + ' ago';
+  // Older than ~2 months — show absolute date.
+  return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+/* ageColor(iso) — green ≤7d, yellow 7-28d, red >28d, gray if null. Visual
+ * cue only — never blocks the user from anything. */
+function ageColor(iso) {
+  if (!iso) return 'gray';
+  const days = (Date.now() - new Date(iso).getTime()) / 86400000;
+  if (days <= 7)  return 'green';
+  if (days <= 28) return 'yellow';
+  return 'red';
+}
+
+/* normName(s) — lowercase + collapse whitespace + strip surrounding punct.
+ * Used as a join key for "Smith, John" ↔ "smith,  john" ↔ "Smith,John ". */
+function normName(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[ \s]+/g, ' ')
+    .trim();
+}
+
+/* formatName(raw) — flip "LAST, FIRST" → "First Last" + title-case.
+ * Used for slip output (per legacy PatchZilla _formatName). */
+function formatName(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  if (s.indexOf(',') >= 0) {
+    const parts = s.split(',');
+    const last = parts[0].trim();
+    const first = parts.slice(1).join(',').trim();
+    s = first + ' ' + last;
+  }
+  return s.replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.substr(1).toLowerCase());
+}
+
+/* splitCols(line) — split a pasted row into columns. Spreadsheets use TAB
+ * when copied, but operators sometimes paste from PDFs / aligned text where
+ * columns are separated by 2+ spaces. We accept both: prefer TAB when present,
+ * fall back to runs of 2+ spaces. Always trim each cell. */
+function splitCols(line) {
+  if (line.indexOf('\t') >= 0) {
+    return line.split('\t').map(c => c.trim());
+  }
+  return line.split(/[  ]{2,}/).map(c => c.trim()).filter(Boolean);
+}
+
+/* sb(method, path, body) — Supabase REST helper. Throws on non-2xx so
+ * callers can try/catch. Path is appended to /rest/v1/ — caller passes
+ * the table name + query string. */
+async function sb(method, path, body) {
+  const opts = { method, headers: method === 'GET' ? HEADERS_READ : HEADERS_WRITE };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(SB_URL + '/rest/v1/' + path, opts);
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error('Supabase ' + r.status + ': ' + txt.substring(0, 300));
+  }
+  if (r.status === 204) return null;
+  const ct = r.headers.get('Content-Type') || '';
+  return ct.includes('json') ? r.json() : r.text();
+}
+
+/* uploadStorage(path, blob, contentType) — PUT a file to the `patchzilla`
+ * bucket. Uses x-upsert: true so re-uploading the same slot overwrites. */
+async function uploadStorage(path, blob, contentType) {
+  const url = SB_URL + '/storage/v1/object/' + BUCKET + '/' + encodeURI(path);
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {
+      apikey: SB_ANON,
+      Authorization: 'Bearer ' + SB_ANON,
+      'Content-Type': contentType || 'application/octet-stream',
+      'x-upsert': 'true',
+      'Cache-Control': 'public, max-age=3600'
+    },
+    body: blob
+  });
+  if (!r.ok) throw new Error('Storage upload ' + r.status + ': ' + (await r.text()).substring(0, 200));
+  return r.json();
+}
+
+/* deleteStorage(path) — best-effort delete from Storage. We don't fail
+ * the UX if this errors (the JSONB pointer is the source of truth). */
+async function deleteStorage(path) {
+  const url = SB_URL + '/storage/v1/object/' + BUCKET + '/' + encodeURI(path);
+  try {
+    await fetch(url, { method: 'DELETE', headers: { apikey: SB_ANON, Authorization: 'Bearer ' + SB_ANON } });
+  } catch (_) {}
+}
+
+/* storagePublicUrl(path) — build the public URL for a bucket object.
+ * Bucket is configured public-read so this works without signing. */
+function storagePublicUrl(path) {
+  // Cache-bust with a timestamp so refreshing the art slot shows the new
+  // image immediately (Supabase + CDN otherwise serve the cached version).
+  return SB_URL + '/storage/v1/object/public/' + BUCKET + '/' + encodeURI(path) + '?t=' + Date.now();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   AUTO-UPDATE — poll apa_core.apps for our row's `version` column. If it
+   changes from APP_VERSION, show the overlay and start polling our own
+   index.html for the new version string, then hard-reload. Same pattern
+   as OnTheFelt admin.
+   ════════════════════════════════════════════════════════════════════════ */
+async function checkVersion() {
+  if (_versionMismatch) return;
+  try {
+    const r = await fetch(SB_URL + '/rest/v1/apps?app_name=eq.' + APP_NAME + '&select=version', { headers: HEADERS_APA });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d || !d.length) return;
+    if (d[0].version && d[0].version !== APP_VERSION) {
+      _versionMismatch = true;
+      document.getElementById('updateOverlay').classList.add('shown');
+      pollForDeploy(d[0].version);
+    }
+  } catch (_) {}
+}
+function pollForDeploy(target) {
+  setTimeout(async () => {
+    try {
+      const r = await fetch('index.html?_=' + Date.now());
+      if (r.ok) {
+        const html = await r.text();
+        if (html.indexOf("APP_VERSION = '" + target + "'") !== -1) { location.reload(true); return; }
+      }
+    } catch (_) {}
+    pollForDeploy(target);
+  }, 3000);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   OPERATOR — load / create / persist
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* loadOperators() — list every operator row (slug + display_name) for the
+ * key-gate picker. Only called when ?op= is missing/unknown. */
+async function loadOperators() {
+  return await sb('GET', 'operators?select=slug,display_name&order=slug.asc');
+}
+
+/* loadOperator(slug) — fetch a single row. Returns null on 404/empty. */
+async function loadOperator(slug) {
+  const list = await sb('GET', 'operators?slug=eq.' + encodeURIComponent(slug) + '&select=*');
+  return (list && list.length) ? list[0] : null;
+}
+
+/* createOperator(slug) — INSERT a fresh row with sensible defaults. After
+ * creation the user lands on the Profile tab to fill in their league name. */
+async function createOperator(slug) {
+  const row = {
+    slug: slug,
+    display_name: slug,                  // placeholder — user edits in Profile
+    patch_mode: 'per_occurrence',
+    art: { slip_left: null, slip_right: null, env_left: null, env_right: null }
+  };
+  const result = await sb('POST', 'operators', row);
+  return Array.isArray(result) ? result[0] : result;
+}
+
+/* patchOperator(patch) — PATCH the current operator's row + update local
+ * cache so dependent UI (header, freshness boxes, etc.) reflects it. */
+async function patchOperator(patch) {
+  const result = await sb('PATCH', 'operators?slug=eq.' + encodeURIComponent(_operator.slug), patch);
+  if (Array.isArray(result) && result[0]) Object.assign(_operator, result[0]);
+  else Object.assign(_operator, patch);
+  return _operator;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   KEY GATE — operator picker / create UI
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* showKeyGate(unknownSlug) — render the "no op" gate. If the user typed a
+ * slug that doesn't exist, offer to create it. Otherwise just show the
+ * list of existing slugs they can click into. */
+async function showKeyGate(unknownSlug) {
+  document.getElementById('keyGate').classList.remove('hidden');
+  document.getElementById('appMain').classList.add('hidden');
+  document.getElementById('tabsBar').classList.add('hidden');
+
+  const titleEl = document.getElementById('keyGateTitle');
+  const msgEl   = document.getElementById('keyGateMsg');
+  const pickerEl = document.getElementById('opPickerWrap');
+  const createEl = document.getElementById('createOpWrap');
+
+  // Load the list of existing operators so the user can pick.
+  let ops = [];
+  try { ops = await loadOperators(); } catch (e) { /* ignore — show empty list */ }
+
+  if (unknownSlug) {
+    titleEl.textContent = 'Operator "' + unknownSlug + '" not found';
+    msgEl.innerHTML = 'No operator with that slug exists yet. You can create it, or pick an existing one below.';
+    createEl.innerHTML =
+      '<button class="btn btn-primary" id="createBtn">Create operator: ' + esc(unknownSlug) + '</button>';
+    document.getElementById('createBtn').addEventListener('click', async () => {
+      try {
+        await createOperator(unknownSlug);
+        // Reload — the slug is now valid, so the page will load it normally.
+        location.reload();
+      } catch (e) {
+        alert('Create failed: ' + e.message);
+      }
+    });
+  } else {
+    titleEl.textContent = 'Operator required';
+    msgEl.innerHTML = 'Append <code>?op=&lt;your-slug&gt;</code> to the URL to enter, or pick an existing operator below.';
+    createEl.innerHTML = '';
+  }
+
+  if (ops && ops.length) {
+    let html = '<label style="margin-bottom:6px">Existing operators</label>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    for (const o of ops) {
+      html += '<a class="btn btn-outline btn-sm" href="?op=' + encodeURIComponent(o.slug) + '">'
+            + esc(o.display_name || o.slug) + ' <span style="opacity:.6;margin-left:6px">(' + esc(o.slug) + ')</span></a>';
+    }
+    html += '</div>';
+    pickerEl.innerHTML = html;
+  } else {
+    pickerEl.innerHTML = '<p class="hint">No operators exist yet. Add one to <code>?op=mynewslug</code> in the URL bar to start a fresh tenant.</p>';
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PROFILE TAB — render fields, autosave on blur/change
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* hydrateProfileForm() — copy current operator state → DOM inputs. */
+function hydrateProfileForm() {
+  document.getElementById('profDisplayName').value   = _operator.display_name   || '';
+  document.getElementById('profPatchMode').value     = _operator.patch_mode     || 'per_occurrence';
+  document.getElementById('profReturnName').value    = _operator.return_name    || '';
+  document.getElementById('profReturnAddress').value = _operator.return_address || '';
+  document.getElementById('profReturnCity').value    = _operator.return_city    || '';
+  document.getElementById('profReturnState').value   = _operator.return_state   || '';
+  document.getElementById('profReturnZip').value     = _operator.return_zip     || '';
+  // Header subpage = league name for at-a-glance tenant identification.
+  document.getElementById('appSubpage').textContent = _operator.display_name ? '— ' + _operator.display_name : '';
+  document.getElementById('opBadge').textContent = (_operator.slug || '').toUpperCase();
+}
+
+/* saveProfile() — Save-button handler for the profile card. Patches every
+ * field at once so address tweaks land in one round-trip. */
+async function saveProfile() {
+  const btn = document.getElementById('profileSaveBtn');
+  btn.disabled = true;
+  try {
+    const patch = {
+      display_name:   document.getElementById('profDisplayName').value.trim(),
+      patch_mode:     document.getElementById('profPatchMode').value,
+      return_name:    document.getElementById('profReturnName').value.trim(),
+      return_address: document.getElementById('profReturnAddress').value.trim(),
+      return_city:    document.getElementById('profReturnCity').value.trim(),
+      return_state:   document.getElementById('profReturnState').value.trim().toUpperCase(),
+      return_zip:     document.getElementById('profReturnZip').value.trim()
+    };
+    await patchOperator(patch);
+    hydrateProfileForm();
+    setStatus('profileStatus', 'Saved.', 'ok');
+  } catch (e) {
+    setStatus('profileStatus', 'Save failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* wireProfileAutosave() — display_name + patch_mode autosave on change so
+ * the slip header updates instantly. The address fields wait for Save (so
+ * the user can finish typing without a flurry of partial PATCHes). */
+function wireProfileAutosave() {
+  const onChange = async (id, field, transform) => {
+    const el = document.getElementById(id);
+    el.addEventListener('change', async () => {
+      const val = transform ? transform(el.value) : el.value.trim();
+      try { await patchOperator({ [field]: val }); hydrateProfileForm(); }
+      catch (e) { setStatus('profileStatus', 'Autosave failed: ' + e.message, 'err'); }
+    });
+  };
+  onChange('profDisplayName', 'display_name');
+  onChange('profPatchMode',   'patch_mode');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   ART SLOTS — render 4 cards, handle upload/delete via Storage + JSONB
+   ════════════════════════════════════════════════════════════════════════ */
+
+const ART_SLOTS = [
+  { key: 'slip_left',  label: 'Slip — left'  },
+  { key: 'slip_right', label: 'Slip — right' },
+  { key: 'env_left',   label: 'Envelope — left'  },
+  { key: 'env_right',  label: 'Envelope — right' }
+];
+
+/* renderArtGrid() — paint the 4 art-slot cards with current state.
+ * Re-rendered after every upload/delete so thumbnails always reflect server. */
+function renderArtGrid() {
+  const grid = document.getElementById('artGrid');
+  const art = _operator.art || {};
+  grid.innerHTML = ART_SLOTS.map(slot => {
+    const url = art[slot.key];
+    const has = !!url;
+    const thumb = has
+      ? '<img src="' + esc(url) + '" alt="' + esc(slot.label) + '">'
+      : '<span class="empty-art">No image</span>';
+    return ''
+      + '<div class="art-slot' + (has ? ' has-art' : '') + '">'
+      +   '<div class="art-label">' + esc(slot.label) + '</div>'
+      +   '<div class="art-thumb">' + thumb + '</div>'
+      +   '<div class="art-actions">'
+      +     '<label class="art-upload-btn">Upload<input type="file" accept="image/*" data-slot="' + esc(slot.key) + '"></label>'
+      +     (has ? '<button class="btn btn-outline btn-sm" data-delete-slot="' + esc(slot.key) + '">Remove</button>' : '')
+      +   '</div>'
+      + '</div>';
+  }).join('');
+
+  // Wire upload inputs.
+  grid.querySelectorAll('input[type="file"][data-slot]').forEach(inp => {
+    inp.addEventListener('change', e => uploadArt(inp.dataset.slot, inp));
+  });
+  // Wire delete buttons.
+  grid.querySelectorAll('button[data-delete-slot]').forEach(btn => {
+    btn.addEventListener('click', () => removeArt(btn.dataset.deleteSlot));
+  });
+}
+
+/* uploadArt(slot, fileInput) — PUT the chosen file to <slug>/<slot>.<ext>,
+ * then PATCH operators.art so the JSONB pointer matches.
+ * - We compute extension from the file's MIME type (falls back to .png) so
+ *   we don't have to trust the user-supplied filename.
+ * - Replacing an existing file overwrites in place (x-upsert). */
+async function uploadArt(slot, fileInput) {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) return;
+  if (f.size > 1024 * 1024) {
+    if (!confirm('This image is ' + Math.round(f.size / 1024) + ' KB. Large images may be slow to load. Continue?')) {
+      fileInput.value = '';
+      return;
+    }
+  }
+  // Pick a sensible extension from the MIME type. Defaulting to png keeps
+  // browsers happy when MIME is missing or generic.
+  const ext = (
+    f.type === 'image/png'  ? 'png'  :
+    f.type === 'image/jpeg' ? 'jpg'  :
+    f.type === 'image/webp' ? 'webp' :
+    f.type === 'image/gif'  ? 'gif'  :
+    f.type === 'image/svg+xml' ? 'svg' : 'png'
+  );
+  const path = _operator.slug + '/' + slot + '.' + ext;
+  try {
+    await uploadStorage(path, f, f.type || 'image/png');
+    const newArt = Object.assign({}, _operator.art || {});
+    newArt[slot] = storagePublicUrl(path);
+    await patchOperator({ art: newArt });
+    renderArtGrid();
+  } catch (e) {
+    alert('Upload failed: ' + e.message);
+  } finally {
+    fileInput.value = '';
+  }
+}
+
+/* removeArt(slot) — null the JSONB pointer + best-effort delete from
+ * Storage. We try every common extension because we don't know which one
+ * was uploaded last (and the JSONB only stores the URL, not the ext). */
+async function removeArt(slot) {
+  if (!confirm('Remove this art?')) return;
+  try {
+    const newArt = Object.assign({}, _operator.art || {});
+    newArt[slot] = null;
+    await patchOperator({ art: newArt });
+    // Best-effort cleanup — don't block on failure.
+    for (const ext of ['png','jpg','jpeg','webp','gif','svg']) {
+      deleteStorage(_operator.slug + '/' + slot + '.' + ext);
+    }
+    renderArtGrid();
+  } catch (e) {
+    alert('Remove failed: ' + e.message);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   CONTACTS TAB — freshness boxes, parsers, generate, saved table
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* renderFreshnessBoxes() — paint the two top-of-tab boxes from operator's
+ * team_paste_at + players_paste_at. Color is purely advisory. */
+function renderFreshnessBoxes() {
+  const t = _operator.team_paste_at || null;
+  const p = _operator.players_paste_at || null;
+  const tDot = document.getElementById('freshTeamDot');
+  const pDot = document.getElementById('freshPlayerDot');
+  tDot.className = 'fresh-dot ' + ageColor(t);
+  pDot.className = 'fresh-dot ' + ageColor(p);
+  document.getElementById('freshTeamWhen').textContent   = fmtAge(t);
+  document.getElementById('freshPlayerWhen').textContent = fmtAge(p);
+}
+
+/* detectHeader(cols, candidates) — case-insensitive: returns true if the
+ * first cell looks like a column-header rather than data. */
+function looksLikeHeaderRow(cols, headerHints) {
+  if (!cols || !cols.length) return false;
+  const first = (cols[0] || '').toLowerCase().trim();
+  return headerHints.some(h => first === h);
+}
+
+/* parseTeamList() — reads the team-list textarea and populates _teamRows.
+ * Columns: team_number, team_name, captain_name, [co_captain_name].
+ * Header detection: if first cell of row 0 matches "team", "team #",
+ * "team number", etc., we skip that row. */
+function parseTeamList() {
+  _teamRows = [];
+  const raw = document.getElementById('teamPaste').value || '';
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    document.getElementById('teamStats').innerHTML = '';
+    refreshGenerateButton();
+    return;
+  }
+  let start = 0;
+  const firstCols = splitCols(lines[0]);
+  if (looksLikeHeaderRow(firstCols, ['team', 'team#', 'team #', 'team number', 'teams'])) start = 1;
+
+  let bad = 0;
+  for (let i = start; i < lines.length; i++) {
+    const cols = splitCols(lines[i]);
+    if (!cols.length) continue;
+    const team_number     = (cols[0] || '').trim();
+    const team_name       = (cols[1] || '').trim();
+    const captain_name    = (cols[2] || '').trim();
+    const co_captain_name = (cols[3] || '').trim() || null;
+    // Require a team number AND a captain name. Anything else → bad row.
+    if (!team_number || !captain_name) { bad++; continue; }
+    // Normalize team_number — strip leading zeros so "05012" matches "5012".
+    // (Memory rule: String(parseInt(team, 10)) — never zero-pad.)
+    const tnNorm = /^\d+$/.test(team_number) ? String(parseInt(team_number, 10)) : team_number;
+    _teamRows.push({ team_number: tnNorm, team_name, captain_name, co_captain_name });
+  }
+  let html = '<span class="stat-badge good">' + _teamRows.length + ' team' + (_teamRows.length === 1 ? '' : 's') + '</span>';
+  if (bad) html += '<span class="stat-badge warn">' + bad + ' skipped (missing team# or captain)</span>';
+  document.getElementById('teamStats').innerHTML = html;
+  refreshGenerateButton();
+}
+
+/* parsePlayerList() — reads the all-players textarea, populates _playerRows
+ * with a `_key` field = normalized player name (for fast captain lookup).
+ * Columns: apa_number, name, address1, address2, city, state, zip. */
+function parsePlayerList() {
+  _playerRows = [];
+  const raw = document.getElementById('playerPaste').value || '';
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    document.getElementById('playerStats').innerHTML = '';
+    refreshGenerateButton();
+    return;
+  }
+  let start = 0;
+  const firstCols = splitCols(lines[0]);
+  if (looksLikeHeaderRow(firstCols, ['apa', 'apa#', 'apa #', 'apa number', 'member', 'member#', 'member #'])) start = 1;
+
+  let bad = 0;
+  for (let i = start; i < lines.length; i++) {
+    const cols = splitCols(lines[i]);
+    if (!cols.length) continue;
+    const apa_number = (cols[0] || '').trim();
+    const name       = (cols[1] || '').trim();
+    if (!name) { bad++; continue; }
+    _playerRows.push({
+      apa_number,
+      name,
+      address1: (cols[2] || '').trim(),
+      address2: (cols[3] || '').trim() || null,
+      city:     (cols[4] || '').trim(),
+      state:    (cols[5] || '').trim().toUpperCase(),
+      zip:      (cols[6] || '').trim(),
+      _key:     normName(name)
+    });
+  }
+  let html = '<span class="stat-badge good">' + _playerRows.length + ' player' + (_playerRows.length === 1 ? '' : 's') + '</span>';
+  if (bad) html += '<span class="stat-badge warn">' + bad + ' skipped (missing name)</span>';
+  document.getElementById('playerStats').innerHTML = html;
+  refreshGenerateButton();
+}
+
+/* refreshGenerateButton() — enable Generate only when both lists have data.
+ * Color/copy stays consistent so the user knows what's missing. */
+function refreshGenerateButton() {
+  const btn = document.getElementById('generateBtn');
+  if (!btn) return;
+  btn.disabled = !(_teamRows.length && _playerRows.length);
+}
+
+/* generateMailingContacts() — the heart of the new flow.
+ * 1. Build a player-by-name lookup.
+ * 2. For every team, look up its captain. Collect any miss.
+ * 3. If ANY captain is unmatched → render a red panel listing them and
+ *    refuse to write. The user fixes the source data and tries again.
+ * 4. On a clean match → DELETE every existing mailing_contact for this
+ *    operator, INSERT the new rows, then PATCH the operator's
+ *    team_paste_at + players_paste_at to "now". */
+async function generateMailingContacts() {
+  const btn = document.getElementById('generateBtn');
+  document.getElementById('unmatchedWrap').innerHTML = '';
+  if (!_teamRows.length || !_playerRows.length) return;
+
+  // Build name → playerRow map. If two players share a normalized name
+  // we keep the first; this is rare but worth flagging if it happens.
+  const playerByName = new Map();
+  for (const p of _playerRows) {
+    if (!playerByName.has(p._key)) playerByName.set(p._key, p);
+  }
+
+  // Match every captain to a player row. Collect misses for the error UI.
+  const matched = [];
+  const unmatched = [];
+  for (const t of _teamRows) {
+    const k = normName(t.captain_name);
+    const p = playerByName.get(k);
+    if (!p) { unmatched.push(t); continue; }
+    matched.push({
+      operator_slug:    _operator.slug,
+      team_number:      t.team_number,
+      team_name:        t.team_name || null,
+      captain_name:     t.captain_name,
+      co_captain_name:  t.co_captain_name || null,
+      address1:         p.address1 || '',
+      address2:         p.address2 || null,
+      city:             p.city || '',
+      state:            p.state || '',
+      zip:              p.zip || ''
+    });
+  }
+
+  // Hard error path — refuse to save while any captain is missing. The user
+  // needs to fix this in the source data, not work around it here.
+  if (unmatched.length) {
+    let html = '<div class="unmatched-panel">';
+    html += '<h3>' + unmatched.length + ' captain' + (unmatched.length === 1 ? '' : 's') + ' not found in player list</h3>';
+    html += '<p class="hint" style="margin-bottom:8px">Generation refused. Fix the source spreadsheet (typo, missing player, etc.) and re-paste.</p>';
+    html += '<ul>';
+    for (const u of unmatched) {
+      html += '<li>Team <strong>' + esc(u.team_number) + '</strong> '
+            + (u.team_name ? '(' + esc(u.team_name) + ') ' : '')
+            + '— captain <strong>' + esc(u.captain_name) + '</strong></li>';
+    }
+    html += '</ul></div>';
+    document.getElementById('unmatchedWrap').innerHTML = html;
+    setStatus('generateStatus', 'Refused — see unmatched captains below.', 'err');
+    return;
+  }
+
+  // All clean. Replace the entire mailing_contacts table for this operator.
+  btn.disabled = true;
+  setStatus('generateStatus', 'Saving…', 'warn');
+  try {
+    // 1. Clear out any existing rows for this operator.
+    await sb('DELETE', 'mailing_contacts?operator_slug=eq.' + encodeURIComponent(_operator.slug));
+    // 2. Insert all the freshly-built rows in one shot.
+    if (matched.length) {
+      await sb('POST', 'mailing_contacts', matched);
+    }
+    // 3. Stamp the freshness fields so the dots go green.
+    const now = new Date().toISOString();
+    await patchOperator({ team_paste_at: now, players_paste_at: now });
+    // 4. Refresh UI.
+    renderFreshnessBoxes();
+    await loadSavedContacts();
+    setStatus('generateStatus', 'Saved ' + matched.length + ' mailing contact' + (matched.length === 1 ? '' : 's') + '.', 'ok');
+  } catch (e) {
+    setStatus('generateStatus', 'Save failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* loadSavedContacts() — pull the current mailing_contacts rows + render
+ * the read-only table at the bottom of the contacts tab. */
+async function loadSavedContacts() {
+  _savedContacts = await sb('GET',
+    'mailing_contacts?operator_slug=eq.' + encodeURIComponent(_operator.slug)
+    + '&select=*&order=team_number.asc'
+  );
+  renderSavedTable();
+}
+
+/* renderSavedTable() — paints the saved contacts table. Sorted by
+ * numeric team_number (so 5012 sits with 5013, not "10000"). */
+function renderSavedTable() {
+  const body = document.getElementById('savedBody');
+  const cnt = document.getElementById('savedCount');
+  cnt.textContent = _savedContacts.length ? '(' + _savedContacts.length + ')' : '';
+  if (!_savedContacts.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">No mailing contacts yet. Use the paste boxes above to generate.</td></tr>';
+    return;
+  }
+  // Keep the server's order (we asked for team_number.asc) but add a numeric
+  // tiebreaker for safety against alpha-sort surprises.
+  const sorted = _savedContacts.slice().sort((a, b) => {
+    const na = parseInt(a.team_number, 10), nb = parseInt(b.team_number, 10);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return String(a.team_number).localeCompare(String(b.team_number));
+  });
+  body.innerHTML = sorted.map(c => {
+    const captainCell = esc(c.captain_name || '')
+      + (c.co_captain_name ? '<br><span class="hint">+ ' + esc(c.co_captain_name) + '</span>' : '');
+    const addrCell = esc(c.address1 || '')
+      + (c.address2 ? '<br>' + esc(c.address2) : '');
+    return '<tr>'
+      + '<td><strong>' + esc(c.team_number) + '</strong></td>'
+      + '<td>' + esc(c.team_name || '') + '</td>'
+      + '<td>' + captainCell + '</td>'
+      + '<td>' + addrCell + '</td>'
+      + '<td>' + esc(c.city || '') + '</td>'
+      + '<td>' + esc(c.state || '') + '</td>'
+      + '<td>' + esc(c.zip || '') + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SLIPS TAB — SP log parser, output renderer, print builders
+   The parser is a faithful port of legacy PatchZilla parseSPLog().
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* parseSPLog(rawText) — populate _spData from the textarea contents.
+ * Contract (matches legacy):
+ *   - header row required; column names are matched case-insensitively
+ *   - rows with Mailed='Yes' are skipped
+ *   - SP columns = everything between Team# and Rec'd
+ *   - cell can be: blank/0 (skip), pure integer N (N awards or 1 in
+ *     per_type mode), 'X' (one award), or any other text (prepended to
+ *     header → "9 BALL MINI SLAM")
+ *   - rendering of the stats badge mirrors the old layout */
+function parseSPLog(rawText) {
+  _spData = []; _spHeaders = [];
+  if (!rawText || !rawText.trim()) {
+    document.getElementById('spStats').innerHTML = '';
+    return;
+  }
+  const lines = rawText.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return;
+
+  // Spreadsheets always paste with TAB, so SP log specifically uses '\t' (not
+  // splitCols — we want columns to stay positional even when blank).
+  const headers = lines[0].split('\t').map(h => h.trim());
+  const hLower = headers.map(h => h.toLowerCase());
+
+  // Locate the fixed columns by name. Fallback to positional if not found.
+  let iMailed = -1, iDateWk = -1, iMember = -1, iName = -1, iTeam = -1, iRecd = -1;
+  for (let hi = 0; hi < hLower.length; hi++) {
+    const hl = hLower[hi];
+    if (hl === 'mailed') iMailed = hi;
+    else if (hl === 'date/wk' || hl === 'date' || hl === 'week' || hl === 'wk') iDateWk = hi;
+    else if (hl === 'member #' || hl === 'member#' || hl === 'member') iMember = hi;
+    else if (hl === 'name') iName = hi;
+    else if (hl === 'team #' || hl === 'team#' || hl === 'team') iTeam = hi;
+    else if (hl === "rec'd" || hl === 'recd' || hl === 'received') iRecd = hi;
+  }
+  if (iMailed === -1) iMailed = 0;
+  if (iDateWk === -1) iDateWk = 1;
+  if (iMember === -1) iMember = 2;
+  if (iName === -1)   iName   = 3;
+  if (iTeam === -1)   iTeam   = 4;
+  if (iRecd === -1)   iRecd   = headers.length - 1;
+
+  for (let si = iTeam + 1; si < iRecd; si++) {
+    _spHeaders.push({ index: si, name: headers[si] || ('SP ' + si) });
+  }
+
+  let skippedMailed = 0;
+  let totalAwards = 0;
+  const uniquePlayers = {};
+
+  for (let ri = 1; ri < lines.length; ri++) {
+    const cols = lines[ri].split('\t');
+    if (cols.length < iTeam + 1) continue;
+
+    const mailed = (cols[iMailed] || '').trim().toLowerCase();
+    if (mailed === 'yes') { skippedMailed++; continue; }
+
+    const memberNum = (cols[iMember] || '').trim();
+    const name      = (cols[iName] || '').trim();
+    const teamNum   = (cols[iTeam] || '').trim();
+    const dateWk    = (cols[iDateWk] || '').trim();
+    if (!memberNum && !name) continue;
+
+    // Build the awards list for this row.
+    const awards = [];
+    for (const sh of _spHeaders) {
+      const val = (cols[sh.index] || '').trim();
+      if (!val || val === '0') continue;
+
+      // Pure integer? — treat as a count. parseInt("9 BALL") would silently
+      // pass leading-9 even though "9 BALL" is a label, so we test with regex.
+      const isNumeric = /^\d+$/.test(val);
+      if (isNumeric && parseInt(val, 10) > 0) {
+        const numVal = parseInt(val, 10);
+        const count = (_operator.patch_mode === 'per_type') ? 1 : numVal;
+        for (let ci = 0; ci < count; ci++) {
+          awards.push({ header: sh.name, display: sh.name.toUpperCase() });
+        }
+      } else if (val.toLowerCase() === 'x') {
+        awards.push({ header: sh.name, display: sh.name.toUpperCase() });
+      } else {
+        // Text value (e.g. "9 Ball" in Mini Slam column) — prepend it to header.
+        awards.push({ header: sh.name, display: (val + ' ' + sh.name).toUpperCase() });
+      }
+    }
+    if (!awards.length) continue;
+
+    // Normalize team# the same way as elsewhere in this app.
+    const tnNorm = /^\d+$/.test(teamNum) ? String(parseInt(teamNum, 10)) : teamNum;
+
+    _spData.push({ dateWk, memberNum, name, teamNum: tnNorm, awards });
+    totalAwards += awards.length;
+    uniquePlayers[memberNum || name] = true;
+  }
+
+  document.getElementById('spStats').innerHTML =
+      '<span class="stat-badge">' + _spData.length + ' rows</span>'
+    + '<span class="stat-badge">' + Object.keys(uniquePlayers).length + ' players</span>'
+    + '<span class="stat-badge">' + totalAwards + ' patches</span>'
+    + (skippedMailed > 0 ? '<span class="stat-badge warn">' + skippedMailed + ' mailed (skipped)</span>' : '');
+}
+
+/* generateOutput() — group rows into envelopes:
+ *   - one slip per (player, team) combo
+ *   - one envelope per mailing contact (joined by team number)
+ *   - teams missing a contact get bucketed into "No Contact — Team XXXX"
+ *     so the user sees them and can fix the source data. */
+function generateOutput() {
+  _envelopes = [];
+  if (!_spData.length) { renderOutput(); return; }
+
+  // Build a team_number → contact lookup from _savedContacts. Address1 is
+  // what we use as the "address" — if address2 is present we tack it on.
+  const contactsByTeam = {};
+  for (const c of _savedContacts) {
+    contactsByTeam[c.team_number] = {
+      name: c.captain_name || c.team_name || 'Team ' + c.team_number,
+      teamName: c.team_name || '',
+      coCaptain: c.co_captain_name || '',
+      address: c.address1 || '',
+      address2: c.address2 || '',
+      city: c.city || '',
+      state: c.state || '',
+      zip: c.zip || ''
+    };
+  }
+
+  // Step 1 — collapse rows into one slip per (member, team).
+  const slipMap = {};
+  for (const row of _spData) {
+    const key = (row.memberNum || row.name) + '|' + row.teamNum;
+    if (!slipMap[key]) {
+      slipMap[key] = {
+        playerName: row.name, memberNum: row.memberNum,
+        teamNum: row.teamNum, awards: []
+      };
+    }
+    if (row.name.length > slipMap[key].playerName.length) slipMap[key].playerName = row.name;
+    for (const a of row.awards) slipMap[key].awards.push(a);
+  }
+
+  // Step 2 — group slips by mailing contact (address-key).
+  const envMap = {};
+  for (const sk in slipMap) {
+    const slip = slipMap[sk];
+    let contact = contactsByTeam[slip.teamNum];
+    let addrKey;
+    if (contact && contact.address) {
+      addrKey = (contact.name + '|' + contact.address + '|' + contact.city + '|' + contact.state + '|' + contact.zip).toLowerCase();
+    } else if (contact) {
+      addrKey = 'no-addr|' + contact.name.toLowerCase();
+    } else {
+      addrKey = 'no-contact|' + slip.teamNum;
+      contact = { name: 'No Contact — Team ' + slip.teamNum, address: '', city: '', state: '', zip: '' };
+    }
+    if (!envMap[addrKey]) {
+      envMap[addrKey] = { contact, teams: {}, slips: [], totalPatches: 0 };
+    }
+    envMap[addrKey].teams[slip.teamNum] = true;
+    envMap[addrKey].slips.push(slip);
+    envMap[addrKey].totalPatches += slip.awards.length;
+  }
+
+  for (const ek in envMap) {
+    const e = envMap[ek];
+    _envelopes.push({
+      mailingContact: e.contact,
+      teams: Object.keys(e.teams).sort((a, b) => parseInt(a) - parseInt(b)),
+      slips: e.slips.sort((a, b) => a.playerName.localeCompare(b.playerName)),
+      totalPatches: e.totalPatches,
+      envelopeCount: Math.ceil(e.totalPatches / MAX_PATCHES_PER_ENVELOPE)
+    });
+  }
+  _envelopes.sort((a, b) => a.mailingContact.name.localeCompare(b.mailingContact.name));
+
+  renderOutput();
+  renderMissingContactWarnings();
+}
+
+/* renderMissingContactWarnings() — show a yellow card if any teams in the
+ * SP data have no mailing contact. Visual only — generation still runs. */
+function renderMissingContactWarnings() {
+  const wrap = document.getElementById('warningsCard');
+  if (!_spData.length) { wrap.innerHTML = ''; return; }
+  const haveContact = new Set(_savedContacts.map(c => c.team_number));
+  const missing = new Set();
+  for (const r of _spData) if (r.teamNum && !haveContact.has(r.teamNum)) missing.add(r.teamNum);
+  if (!missing.size) { wrap.innerHTML = ''; return; }
+  const sorted = Array.from(missing).sort((a, b) => parseInt(a) - parseInt(b));
+  wrap.innerHTML =
+      '<div class="card" style="border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.06)">'
+    +   '<h2 style="color:#fcd34d">Missing mailing contacts for ' + sorted.length + ' team' + (sorted.length === 1 ? '' : 's') + '</h2>'
+    +   '<p class="hint" style="margin-bottom:6px">These will be grouped as <em>"No Contact — Team XXXX"</em> in the output.</p>'
+    +   '<div>' + sorted.map(t => '<span class="stat-badge warn">Team ' + esc(t) + '</span>').join(' ') + '</div>'
+    + '</div>';
+}
+
+/* renderOutput() — paint the summary bar, patch inventory, and envelope
+ * preview cards. Also enables the print buttons. */
+function renderOutput() {
+  let totalSlips = 0, totalPatches = 0, totalEnvelopes = 0;
+  for (const e of _envelopes) {
+    totalSlips += e.slips.length;
+    totalPatches += e.totalPatches;
+    totalEnvelopes += e.envelopeCount;
+  }
+  document.getElementById('outputSummary').innerHTML =
+      '<div class="summary-item"><div class="summary-val">' + totalSlips    + '</div><div class="summary-lbl">Slips</div></div>'
+    + '<div class="summary-item"><div class="summary-val">' + totalPatches  + '</div><div class="summary-lbl">Patches</div></div>'
+    + '<div class="summary-item"><div class="summary-val">' + totalEnvelopes+ '</div><div class="summary-lbl">Envelopes</div></div>'
+    + '<div class="summary-item"><div class="summary-val">' + _envelopes.length + '</div><div class="summary-lbl">Contacts</div></div>';
+
+  // Patch inventory — counts of each award type across all slips.
+  const inv = {};
+  for (const e of _envelopes) for (const s of e.slips) for (const a of s.awards) {
+    inv[a.display] = (inv[a.display] || 0) + 1;
+  }
+  const invKeys = Object.keys(inv).sort();
+  const invCard = document.getElementById('patchInventoryCard');
+  if (invKeys.length) {
+    document.getElementById('invGrid').innerHTML = invKeys.map(k =>
+      '<div class="inv-item"><span class="inv-count">' + inv[k] + '</span>' + esc(k) + '</div>'
+    ).join('');
+    invCard.classList.remove('hidden');
+  } else {
+    invCard.classList.add('hidden');
+  }
+
+  // Envelope preview cards.
+  let html = '';
+  for (const env of _envelopes) {
+    const mc = env.mailingContact;
+    html += '<div class="env-card">';
+    html += '<div class="env-header">' + esc(mc.name) + '</div>';
+    if (mc.address) {
+      html += '<div class="env-addr">' + esc(mc.address) + ', ' + esc(mc.city) + ', ' + esc(mc.state) + ' ' + esc(mc.zip) + '</div>';
+    } else {
+      html += '<div class="env-addr" style="color:#fca5a5">No address on file</div>';
+    }
+    for (const sl of env.slips) {
+      const awardStr = sl.awards.map(a => a.display).join(', ');
+      html += '<div class="env-slip">'
+            +   '<span class="env-slip-name">' + esc(formatName(sl.playerName)) + '</span>'
+            +   '<span class="env-slip-awards">' + esc(awardStr) + '</span>'
+            + '</div>';
+    }
+    html += '<div class="env-meta">Teams: ' + env.teams.join(', ')
+          + ' &middot; ' + env.totalPatches + ' patches'
+          + ' &middot; ' + env.envelopeCount + ' envelope' + (env.envelopeCount !== 1 ? 's' : '')
+          + '</div>';
+    html += '</div>';
+  }
+  document.getElementById('envelopeList').innerHTML = html;
+
+  document.getElementById('printSlipsBtn').disabled = _envelopes.length === 0;
+  document.getElementById('printEnvBtn').disabled = _envelopes.length === 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PRINT BUILDERS — these are line-for-line ports of the legacy GAS
+   PatchZilla print HTML. Print CSS values, page sizes, ornament SVGs,
+   layout rules, and "Nice shooting!" footer are all preserved.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* _generateSampleData() — five fake slips for the "Test slip" / "Test
+ * envelope" buttons. Lets the operator preview their art + return address
+ * before they have any real SP data loaded. */
+function _generateSampleData() {
+  const firstNames = ['Alex','Jordan','Casey','Morgan','Taylor','Riley','Quinn','Avery','Dakota','Reese'];
+  const lastNames  = ['Johnson','Martinez','Thompson','Anderson','Williams','Garcia','Brown','Davis','Wilson','Miller'];
+  const spTypes    = ['8-Ball On the Break','Break & Run','9-Ball On the Snap','9-Ball Break & Run','Mini Slam','Rackless','Clean Sweep'];
+  const teams      = ['81201','92105','87304','94402','82108'];
+  const slips = [];
+  for (let i = 0; i < 5; i++) {
+    const numAwards = 1 + Math.floor(Math.random() * 3);
+    const awards = [], used = {};
+    for (let a = 0; a < numAwards; a++) {
+      let sp; do { sp = spTypes[Math.floor(Math.random() * spTypes.length)]; } while (used[sp]);
+      used[sp] = true;
+      awards.push({ header: sp, display: sp.toUpperCase() });
+    }
+    slips.push({
+      playerName: firstNames[i] + ' ' + lastNames[i],
+      memberNum: String(10000 + Math.floor(Math.random() * 90000)),
+      teamNum: teams[Math.floor(Math.random() * teams.length)],
+      awards
+    });
+  }
+  return [{
+    mailingContact: { name: 'Sample Captain', address: '123 Main St', city: 'Portland', state: 'ME', zip: '04101' },
+    teams: [teams[0], teams[1]],
+    slips,
+    totalPatches: slips.reduce((s, sl) => s + sl.awards.length, 0),
+    envelopeCount: 1
+  }];
+}
+
+/* printSlips(isTest) — open a new window with the slip print layout.
+ * Slips are interleaved by page-position so cutting a stack of pages
+ * leaves them in the correct order (cut-stack-stuff workflow). */
+function printSlips(isTest) {
+  let useEnvelopes = _envelopes;
+  if (isTest && _envelopes.length === 0) useEnvelopes = _generateSampleData();
+  if (!useEnvelopes.length) { alert('Generate output first.'); return; }
+  const envelopes = isTest ? [useEnvelopes[0]] : useEnvelopes;
+
+  const allSlips = [];
+  for (const env of envelopes) for (const s of env.slips) allSlips.push(s);
+  const N = allSlips.length;
+  const P = Math.ceil(N / SLIPS_PER_PAGE);
+
+  // Interleave: page i gets slips [i, P+i, 2P+i, 3P+i, 4P+i].
+  // Cutting a stack of P pages keeps slips in order.
+  const pages = [];
+  for (let pg = 0; pg < P; pg++) {
+    const pageSlips = [];
+    for (let pos = 0; pos < SLIPS_PER_PAGE; pos++) {
+      const idx = pos * P + pg;
+      pageSlips.push(idx < N ? allSlips[idx] : null);
+    }
+    pages.push(pageSlips);
+  }
+
+  const html = _buildSlipHTML(pages, isTest);
+  const w = window.open('', '_blank');
+  if (w) { w.document.write(html); w.document.close(); }
+  else alert('Popup was blocked. Please allow popups for this site.');
+}
+
+/* _buildSlipHTML(pages, isTest) — generate the full HTML document for
+ * the slip print window. Layout copied from legacy PatchZilla; only the
+ * art/league-name sources have changed. */
+function _buildSlipHTML(pages, isTest) {
+  const leagueName = _operator.display_name || _operator.slug || 'APA League';
+  const art = _operator.art || {};
+
+  let h = '<!DOCTYPE html><html><head><meta charset="utf-8">';
+  h += '<title>' + (isTest ? 'TEST ' : '') + 'SP Recognition Slips</title>';
+  h += '<style>';
+
+  // Page setup — Letter, narrow margins, 5 slips per page.
+  h += '@page { size: letter; margin: 0.25in 0.3in; }';
+  h += '* { margin: 0; padding: 0; box-sizing: border-box; }';
+  h += 'body { font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif; color: #000; -webkit-print-color-adjust: exact; print-color-adjust: exact; }';
+  h += '.page { page-break-after: always; height: 10in; display: flex; flex-direction: column; justify-content: space-evenly; }';
+  h += '.page:last-child { page-break-after: auto; }';
+
+  // Individual slip — 1.6in tall.
+  h += '.slip { height: 1.6in; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }';
+  h += '.slip-empty { border: none; height: 1.6in; }';
+
+  // Certificate border (double-frame).
+  h += '.slip-frame { position: absolute; inset: 2px; border: 2px solid #000; }';
+  h += '.slip-frame-inner { position: absolute; inset: 5px; border: 1px solid #000; }';
+
+  // Corner ornaments — SVG flourish in each corner.
+  h += '.corner { position: absolute; width: 20px; height: 20px; }';
+  h += '.corner svg { width: 100%; height: 100%; }';
+  h += '.corner-tl { top: 1px; left: 1px; }';
+  h += '.corner-tr { top: 1px; right: 1px; transform: scaleX(-1); }';
+  h += '.corner-bl { bottom: 1px; left: 1px; transform: scaleY(-1); }';
+  h += '.corner-br { bottom: 1px; right: 1px; transform: scale(-1,-1); }';
+
+  // Content layout.
+  h += '.slip-content { position: relative; z-index: 1; width: 100%; padding: 4px 14px; display: flex; flex-direction: column; align-items: center; gap: 0; }';
+  h += '.slip-org { font-size: 11px; letter-spacing: 4px; text-transform: uppercase; font-weight: 900; }';
+  h += '.slip-rule { display: flex; align-items: center; gap: 4px; margin: 1px 0; }';
+  h += '.slip-rule-line { width: 22px; height: 1px; background: #000; }';
+  h += '.slip-rule-dot { width: 3px; height: 3px; background: #000; border-radius: 50%; }';
+  h += '.slip-name { font-size: 18px; font-style: italic; font-weight: 700; line-height: 1.1; margin: 1px 0; }';
+  h += '.slip-awards { display: flex; align-items: center; justify-content: center; gap: 0; width: 100%; margin: 2px 0 1px; }';
+  h += '.slip-art { height: 36px; width: auto; flex-shrink: 0; }';
+  h += '.slip-boxes { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; padding: 0 6px; }';
+  h += '.award-box { border: 1.5px solid #000; padding: 2px 8px; font-size: 8px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; font-family: "Palatino Linotype", Palatino, Georgia, serif; white-space: nowrap; position: relative; }';
+  h += '.award-box::after { content: ""; position: absolute; inset: 1.5px; border: 0.5px solid #000; pointer-events: none; }';
+  h += '.award-single .award-box { font-size: 9px; padding: 3px 12px; letter-spacing: 1.5px; }';
+  h += '.slip-footer { display: flex; align-items: center; gap: 6px; margin-top: 0; width: 60%; }';
+  h += '.slip-footer-line { flex: 1; height: 1px; background: #000; }';
+  h += '.slip-footer-text { font-size: 8px; font-style: italic; white-space: nowrap; }';
+  h += '.slip-sub { font-size: 7px; color: #444; letter-spacing: 0.5px; }';
+  if (isTest) h += '.test-banner { background: #000; color: #fff; text-align: center; font-size: 10px; font-weight: 700; padding: 3px; letter-spacing: 2px; text-transform: uppercase; }';
+  h += '</style></head><body>';
+
+  if (isTest) h += '<div class="test-banner">Test Page &mdash; Not For Mailing</div>';
+
+  // Corner-flourish SVG (single string, transformed per-corner via CSS).
+  const cornerSVG = '<svg viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">'
+    + '<path d="M2 28 Q2 2 28 2" fill="none" stroke="#000" stroke-width="2"/>'
+    + '<path d="M6 28 Q6 6 28 6" fill="none" stroke="#000" stroke-width="1"/>'
+    + '<circle cx="4" cy="26" r="2" fill="#000"/>'
+    + '<path d="M2 20 Q4 18 6 20" fill="none" stroke="#000" stroke-width="1"/>'
+    + '<path d="M20 2 Q18 4 20 6" fill="none" stroke="#000" stroke-width="1"/>'
+    + '</svg>';
+
+  for (const page of pages) {
+    h += '<div class="page">';
+    for (const s of page) {
+      if (!s) { h += '<div class="slip slip-empty"></div>'; continue; }
+      const spCount = s.awards.length;
+      h += '<div class="slip">';
+      h += '<div class="slip-frame"></div><div class="slip-frame-inner"></div>';
+      h += '<div class="corner corner-tl">' + cornerSVG + '</div>';
+      h += '<div class="corner corner-tr">' + cornerSVG + '</div>';
+      h += '<div class="corner corner-bl">' + cornerSVG + '</div>';
+      h += '<div class="corner corner-br">' + cornerSVG + '</div>';
+      h += '<div class="slip-content">';
+      h +=   '<div class="slip-org">' + esc(leagueName) + '</div>';
+      h +=   '<div class="slip-rule"><span class="slip-rule-line"></span><span class="slip-rule-dot"></span><span class="slip-rule-line"></span></div>';
+      h +=   '<div class="slip-name">' + esc(formatName(s.playerName)) + '</div>';
+      h +=   '<div class="slip-awards' + (spCount === 1 ? ' award-single' : '') + '">';
+      if (art.slip_left)  h += '<img class="slip-art" src="' + esc(art.slip_left)  + '" alt="">';
+      h +=   '<div class="slip-boxes">';
+      for (const a of s.awards) h += '<div class="award-box">' + esc(a.display) + '</div>';
+      h +=   '</div>';
+      if (art.slip_right) h += '<img class="slip-art" src="' + esc(art.slip_right) + '" alt="">';
+      h +=   '</div>';
+      h +=   '<div class="slip-footer"><span class="slip-footer-line"></span><span class="slip-footer-text">Nice shooting!</span><span class="slip-footer-line"></span></div>';
+      h +=   '<div class="slip-sub">Member #' + esc(s.memberNum) + ' &middot; Team ' + esc(s.teamNum) + '</div>';
+      h += '</div></div>';
+    }
+    h += '</div>';
+  }
+
+  h += '</body></html>';
+  return h;
+}
+
+/* printEnvelopes(isTest) — open a new window with #10-envelope print
+ * pages (9.5in × 4.125in), one envelope per page. Skips envelopes that
+ * have no address on file (we'd be wasting paper). */
+function printEnvelopes(isTest) {
+  let useEnvelopes = _envelopes;
+  if (isTest && _envelopes.length === 0) useEnvelopes = _generateSampleData();
+  if (!useEnvelopes.length) { alert('Generate output first.'); return; }
+  const envelopes = isTest ? [useEnvelopes[0]] : useEnvelopes;
+
+  const art = _operator.art || {};
+  let html = '<!DOCTYPE html><html><head><meta charset="utf-8">';
+  html += '<title>' + (isTest ? 'TEST ' : '') + 'SP Patch Envelopes</title>';
+  html += '<style>';
+  html += '@page { size: 9.5in 4.125in; margin: 0; }';
+  html += '* { margin: 0; padding: 0; box-sizing: border-box; }';
+  html += 'body { font-family: "Segoe UI", Arial, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }';
+  html += '.envelope { width: 9.5in; height: 4.125in; page-break-after: always; position: relative; padding: 0; overflow: hidden; }';
+  html += '.envelope:last-child { page-break-after: auto; }';
+  html += '.return-addr { position: absolute; top: 0.25in; left: 0.4in; font-size: 12px; color: #1a1a1a; line-height: 1.4; }';
+  html += '.return-addr .org-name { font-weight: 700; font-size: 14px; }';
+  html += '.to-addr { position: absolute; top: 2in; left: 3.5in; font-size: 14px; font-weight: 600; color: #1a1a1a; line-height: 1.5; }';
+  html += '.env-art-right { position: absolute; right: 0.3in; top: 50%; transform: translateY(-50%); max-height: 3.2in; max-width: 4in; opacity: 0.85; }';
+  html += '.env-art-left { position: absolute; left: 0.3in; bottom: 0.3in; max-height: 2in; max-width: 2.2in; opacity: 0.75; }';
+  html += '.env-teams { position: absolute; bottom: 0.35in; left: 2.6in; font-size: 10px; color: #666; font-weight: 600; }';
+  html += '.env-count { position: absolute; bottom: 0.15in; left: 2.6in; font-size: 9px; color: #999; }';
+  if (isTest) html += '.test-mark { position: absolute; top: 0.15in; right: 0.3in; background: #fef3c7; color: #92400e; padding: 4px 12px; font-size: 10px; font-weight: 700; border-radius: 4px; z-index: 2; }';
+  html += '</style></head><body>';
+
+  for (const env of envelopes) {
+    const mc = env.mailingContact;
+    if (!mc.address) continue;  // skip "No Contact" / address-less rows
+    for (let n = 0; n < env.envelopeCount; n++) {
+      html += '<div class="envelope">';
+      // Return address — pulled from operator profile.
+      html += '<div class="return-addr">';
+      html +=   '<span class="org-name">' + esc(_operator.return_name || _operator.display_name || 'APA League') + '</span><br>';
+      if (_operator.return_address) {
+        html += esc(_operator.return_address) + '<br>';
+        html += esc(_operator.return_city || '') + ', ' + esc(_operator.return_state || '') + ' ' + esc(_operator.return_zip || '');
+      }
+      html += '</div>';
+
+      if (art.env_right) html += '<img class="env-art-right" src="' + esc(art.env_right) + '" alt="">';
+      if (art.env_left)  html += '<img class="env-art-left"  src="' + esc(art.env_left)  + '" alt="">';
+      if (isTest) html += '<div class="test-mark">TEST</div>';
+
+      // Recipient address — captain name + their address1 (+ optional addr2)
+      // + city/state/zip on its own line.
+      let toAddr = esc(mc.name) + '<br>' + esc(mc.address);
+      if (mc.address2) toAddr += '<br>' + esc(mc.address2);
+      if (mc.city) toAddr += '<br>' + esc(mc.city) + ', ' + esc(mc.state) + ' ' + esc(mc.zip);
+      html += '<div class="to-addr">' + toAddr + '</div>';
+
+      html += '<div class="env-teams">Teams: ' + esc(env.teams.join(', ')) + '</div>';
+      if (env.envelopeCount > 1) {
+        html += '<div class="env-count">Envelope ' + (n + 1) + ' of ' + env.envelopeCount + '</div>';
+      }
+      html += '</div>';
+    }
+  }
+
+  html += '</body></html>';
+  const w = window.open('', '_blank');
+  if (w) { w.document.write(html); w.document.close(); }
+  else alert('Popup was blocked. Please allow popups for this site.');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TABS
+   ════════════════════════════════════════════════════════════════════════ */
+const TAB_LABELS = { profile: 'Profile & Art', contacts: 'Mailing Contacts', slips: 'Slips & Envelopes' };
+
+function switchTab(name) {
+  if (!TAB_LABELS[name]) name = 'profile';
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   INIT — wire everything once DOM is ready.
+   Order matters:
+   1. Version-check (background, no await — surfaces stale builds early).
+   2. Operator load — gates the entire UI behind a valid slug.
+   3. Hydrate forms + render art + load saved contacts in parallel.
+   4. Wire input listeners (paste handler on SP textarea, etc.).
+   ════════════════════════════════════════════════════════════════════════ */
+async function init() {
+  // Background version watch.
+  checkVersion();
+  setInterval(checkVersion, 30000);
+
+  // No slug? Show the picker and stop.
+  if (!OP_SLUG) { showKeyGate(null); return; }
+
+  // Try to load the operator. If missing, offer to create.
+  try {
+    _operator = await loadOperator(OP_SLUG);
+  } catch (e) {
+    showKeyGate(null);
+    document.getElementById('keyGateMsg').innerHTML = '<strong style="color:#fca5a5">Failed to reach Supabase: ' + esc(e.message) + '</strong>';
+    return;
+  }
+  if (!_operator) { showKeyGate(OP_SLUG); return; }
+
+  // Operator loaded — reveal the app.
+  document.getElementById('appMain').classList.remove('hidden');
+  document.getElementById('tabsBar').classList.remove('hidden');
+
+  // Wire tabs.
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => switchTab(t.dataset.tab));
+  });
+
+  // Profile tab
+  hydrateProfileForm();
+  wireProfileAutosave();
+
+  // Art tab
+  renderArtGrid();
+
+  // Contacts tab
+  renderFreshnessBoxes();
+  await loadSavedContacts();
+
+  // Slips tab — auto-parse + auto-generate on every keystroke.
+  document.getElementById('spPaste').addEventListener('input', function() {
+    parseSPLog(this.value);
+    if (_spData.length) generateOutput();
+    else { _envelopes = []; renderOutput(); renderMissingContactWarnings(); }
+  });
+
+  // Initial state for the generate button (both lists empty → disabled).
+  refreshGenerateButton();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
