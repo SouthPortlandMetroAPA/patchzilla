@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.00'
+  APP_VERSION = '2.01'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -483,8 +483,8 @@ DEPENDENCIES
             <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="parseTeamList()">Parse team list</button>
           </div>
           <div class="paste-card">
-            <label for="playerPaste">All players — <em>apa#, name, addr1, addr2, city, state, zip</em></label>
-            <textarea id="playerPaste" placeholder="12345678&#9;Smith, John&#9;123 Main St&#9;&#9;Portland&#9;ME&#9;04101"></textarea>
+            <label for="playerPaste">All players — <em>apa#, addr1, addr2, city, state, zip, first, last</em></label>
+            <textarea id="playerPaste" placeholder="12345678&#9;123 Main St&#9;&#9;Portland&#9;ME&#9;04101&#9;John&#9;Smith"></textarea>
             <div class="stats" id="playerStats"></div>
             <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="parsePlayerList()">Parse all players</button>
           </div>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.00';
+const APP_VERSION = '2.01';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -1091,8 +1091,14 @@ function parseTeamList() {
 }
 
 /* parsePlayerList() — reads the all-players textarea, populates _playerRows
- * with a `_key` field = normalized player name (for fast captain lookup).
- * Columns: apa_number, name, address1, address2, city, state, zip. */
+ * with TWO normalized name keys (`_keyFL` = "first last", `_keyLF` = "last, first")
+ * so we can match captain names regardless of which order the operator
+ * typed them in the team list.
+ *
+ * Columns (operator-confirmed 2026-05-05):
+ *   apa#, addr1, addr2, city, state, zip, first_name, last_name
+ *
+ * Composed `name` for display = "First Last". */
 function parsePlayerList() {
   _playerRows = [];
   const raw = document.getElementById('playerPaste').value || '';
@@ -1104,24 +1110,33 @@ function parsePlayerList() {
   }
   let start = 0;
   const firstCols = splitCols(lines[0]);
-  if (looksLikeHeaderRow(firstCols, ['apa', 'apa#', 'apa #', 'apa number', 'member', 'member#', 'member #'])) start = 1;
+  // Header detection: if the first row LOOKS like column titles ("apa",
+  // "first", "last", etc) skip it. Otherwise treat row 0 as data.
+  if (looksLikeHeaderRow(firstCols, ['apa', 'apa#', 'apa #', 'apa number', 'member', 'member#', 'member #', 'first', 'first name'])) start = 1;
 
   let bad = 0;
   for (let i = start; i < lines.length; i++) {
     const cols = splitCols(lines[i]);
     if (!cols.length) continue;
     const apa_number = (cols[0] || '').trim();
-    const name       = (cols[1] || '').trim();
-    if (!name) { bad++; continue; }
+    const first      = (cols[6] || '').trim();
+    const last       = (cols[7] || '').trim();
+    if (!first && !last) { bad++; continue; }
+    const name = (first + ' ' + last).trim();
     _playerRows.push({
       apa_number,
       name,
-      address1: (cols[2] || '').trim(),
-      address2: (cols[3] || '').trim() || null,
-      city:     (cols[4] || '').trim(),
-      state:    (cols[5] || '').trim().toUpperCase(),
-      zip:      (cols[6] || '').trim(),
-      _key:     normName(name)
+      first, last,
+      address1: (cols[1] || '').trim(),
+      address2: (cols[2] || '').trim() || null,
+      city:     (cols[3] || '').trim(),
+      state:    (cols[4] || '').trim().toUpperCase(),
+      zip:      (cols[5] || '').trim(),
+      // Two normalized keys so captain matching works regardless of order:
+      //   "John Smith"  → _keyFL match
+      //   "Smith, John" → _keyLF match
+      _keyFL:   normName(first + ' ' + last),
+      _keyLF:   normName(last + ', ' + first)
     });
   }
   let html = '<span class="stat-badge good">' + _playerRows.length + ' player' + (_playerRows.length === 1 ? '' : 's') + '</span>';
@@ -1151,19 +1166,24 @@ async function generateMailingContacts() {
   document.getElementById('unmatchedWrap').innerHTML = '';
   if (!_teamRows.length || !_playerRows.length) return;
 
-  // Build name → playerRow map. If two players share a normalized name
-  // we keep the first; this is rare but worth flagging if it happens.
-  const playerByName = new Map();
+  // Build TWO name → playerRow maps so a captain typed as either
+  // "John Smith" or "Smith, John" finds the same player row.
+  // (All Players gives us first/last separately; the team paste's captain
+  // column might come in either order — match both.)
+  const byFL = new Map();   // "first last"  → row
+  const byLF = new Map();   // "last, first" → row
   for (const p of _playerRows) {
-    if (!playerByName.has(p._key)) playerByName.set(p._key, p);
+    if (!byFL.has(p._keyFL)) byFL.set(p._keyFL, p);
+    if (!byLF.has(p._keyLF)) byLF.set(p._keyLF, p);
   }
 
-  // Match every captain to a player row. Collect misses for the error UI.
+  // Match every captain to a player row. Try the team paste's captain in
+  // its given form first against both keys. Collect misses for the error UI.
   const matched = [];
   const unmatched = [];
   for (const t of _teamRows) {
     const k = normName(t.captain_name);
-    const p = playerByName.get(k);
+    const p = byFL.get(k) || byLF.get(k);
     if (!p) { unmatched.push(t); continue; }
     matched.push({
       operator_slug:    _operator.slug,
