@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.05'
+  APP_VERSION = '2.06'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.05';
+const APP_VERSION = '2.06';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -664,6 +664,14 @@ function normName(s) {
   return String(s || '').toLowerCase()
     .replace(/[ \s]+/g, ' ')
     .trim();
+}
+
+/* tightKey(s) — normName with every space and comma removed, so "Le Roy" and "LeRoy" collapse to one
+ * key. Used ONLY as a fallback after an exact miss, and ONLY when it resolves to a single player:
+ * it deliberately over-matches ("Jo Ann Smith" and "Joan Nsmith" share a key), so an ambiguous hit
+ * must be refused rather than guessed. */
+function tightKey(s) {
+  return normName(s).replace(/[\s,]+/g, '');
 }
 
 /* formatName(raw) — flip "LAST, FIRST" → "First Last" + title-case.
@@ -1192,18 +1200,42 @@ async function generateMailingContacts() {
   // column might come in either order — match both.)
   const byFL = new Map();   // "first last"  → row
   const byLF = new Map();   // "last, first" → row
+  // Space-insensitive fallback index. Values are ARRAYS, not first-wins: we have to be able to tell
+  // "one player" from "two players that collapse to the same key", because accepting an ambiguous
+  // hit would mail one player's patches to the other one's address. See tightKey() below.
+  const byTight = new Map();
+  const dupExact = [];
   for (const p of _playerRows) {
-    if (!byFL.has(p._keyFL)) byFL.set(p._keyFL, p);
+    if (byFL.has(p._keyFL)) dupExact.push(p._keyFL); else byFL.set(p._keyFL, p);
     if (!byLF.has(p._keyLF)) byLF.set(p._keyLF, p);
+    // Index BOTH name orders, mirroring byFL/byLF — a captain cell may be typed either way, and a
+    // fallback that only knows "first last" silently misses "Davidson, LeRoy".
+    for (const tk of [tightKey(p.first + ' ' + p.last), tightKey(p.last + ', ' + p.first)]) {
+      if (!byTight.has(tk)) byTight.set(tk, []);
+      if (!byTight.get(tk).includes(p)) byTight.get(tk).push(p);
+    }
   }
 
   // Match every captain to a player row. Try the team paste's captain in
   // its given form first against both keys. Collect misses for the error UI.
   const matched = [];
   const unmatched = [];
+  const relaxed = [];     // captains matched only after ignoring spacing — disclosed in the UI
+  const ambiguous = [];   // spacing-insensitive key hit more than one player — never auto-resolved
   for (const t of _teamRows) {
     const k = normName(t.captain_name);
-    const p = byFL.get(k) || byLF.get(k);
+    let p = byFL.get(k) || byLF.get(k);
+    if (!p) {
+      // Exact miss. The two exports may simply disagree about an internal space ("Le Roy" vs
+      // "LeRoy"). Retry ignoring spacing, but ONLY accept a unique hit.
+      const cands = byTight.get(tightKey(t.captain_name)) || [];
+      if (cands.length === 1) {
+        p = cands[0];
+        relaxed.push({ team: t, player: p });
+      } else if (cands.length > 1) {
+        ambiguous.push({ team: t, count: cands.length });
+      }
+    }
     if (!p) { unmatched.push(t); continue; }
     matched.push({
       operator_slug:    _operator.slug,
@@ -1232,6 +1264,19 @@ async function generateMailingContacts() {
             + '— captain <strong>' + esc(u.captain_name) + '</strong></li>';
     }
     html += '</ul></div>';
+    // Ambiguous captains are refused too, but for the opposite reason: the player is in the list
+    // MORE than once under a spacing-insensitive key. Saying "not found" would send the operator
+    // looking for someone who is present twice.
+    if (ambiguous.length) {
+      html += '<div class="unmatched-panel">';
+      html += '<h3>' + ambiguous.length + ' captain' + (ambiguous.length === 1 ? '' : 's') + ' matched more than one player</h3>';
+      html += '<p class="hint" style="margin-bottom:8px">Resolved by ignoring spacing, these names are not unique, so PatchZilla will not guess. Make the spelling in the team list match the player list exactly.</p><ul>';
+      for (const a of ambiguous) {
+        html += '<li>Team <strong>' + esc(a.team.team_number) + '</strong> — captain <strong>'
+             +  esc(a.team.captain_name) + '</strong> matches <strong>' + a.count + '</strong> players</li>';
+      }
+      html += '</ul></div>';
+    }
     document.getElementById('unmatchedWrap').innerHTML = html;
     setStatus('generateStatus', 'Refused — see unmatched captains below.', 'err');
     return;
@@ -1253,7 +1298,25 @@ async function generateMailingContacts() {
     // 4. Refresh UI.
     renderFreshnessBoxes();
     await loadSavedContacts();
-    setStatus('generateStatus', 'Saved ' + matched.length + ' mailing contact' + (matched.length === 1 ? '' : 's') + '.', 'ok');
+    // Disclose every captain that only matched after spacing was ignored. These are correct often
+    // enough to be worth doing automatically and wrong often enough that they must be shown: the
+    // output of this screen becomes a posted envelope.
+    let note = '';
+    if (relaxed.length) {
+      note = '<div class="unmatched-panel">';
+      note += '<h3>' + relaxed.length + ' captain' + (relaxed.length === 1 ? '' : 's') + ' matched by ignoring spacing</h3>';
+      note += '<p class="hint" style="margin-bottom:8px">The team list and the player list spell these names differently (for example "Le Roy" vs "LeRoy"). Each matched exactly one player, so it was accepted — check them before printing.</p><ul>';
+      for (const r of relaxed) {
+        note += '<li>Team <strong>' + esc(r.team.team_number) + '</strong> — team list says <strong>'
+             +  esc(r.team.captain_name) + '</strong>, player list says <strong>'
+             +  esc(r.player.first + ' ' + r.player.last) + '</strong></li>';
+      }
+      note += '</ul></div>';
+    }
+    document.getElementById('unmatchedWrap').innerHTML = note;
+    setStatus('generateStatus', 'Saved ' + matched.length + ' mailing contact' + (matched.length === 1 ? '' : 's') + '.'
+      + (relaxed.length ? ' ' + relaxed.length + ' matched by ignoring spacing — see below.' : ''),
+      relaxed.length ? 'warn' : 'ok');
   } catch (e) {
     setStatus('generateStatus', 'Save failed: ' + e.message, 'err');
   } finally {
