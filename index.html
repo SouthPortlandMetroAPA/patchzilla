@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.07'
+  APP_VERSION = '2.08'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.07';
+const APP_VERSION = '2.08';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -596,7 +596,9 @@ let _operator = null;       // operators row (current tenant)
 let _versionMismatch = false;
 
 // Tab 2 (Contacts) parse state
-let _teamRows   = [];       // [{ team_number, team_name, captain_name, co_captain_name }]
+let _teamRows   = [];       // [{ team_number, team_name, captain_name, co_captain_name }] — deduped by team_number
+let _teamDupCollapsed = 0;  // identical duplicate team rows removed by the last parse (lossless)
+let _teamDupConflicts = []; // [{ team_number, variants }] — same team#, different captain. Blocks Generate.
 let _playerRows = [];       // [{ apa_number, name, address1, address2, city, state, zip, _key }]
 let _savedContacts = [];    // mailing_contacts rows from server
 
@@ -1135,7 +1137,33 @@ function parseTeamList() {
     const tnNorm = /^\d+$/.test(team_number) ? String(parseInt(team_number, 10)) : team_number;
     _teamRows.push({ team_number: tnNorm, team_name, captain_name, co_captain_name });
   }
+  // ── collapse duplicate team numbers ───────────────────────────────────────────────────────────
+  // mailing_contacts is UNIQUE (operator_slug, team_number) and generateMailingContacts posts every
+  // row in ONE insert, so a repeated team number aborts the whole save with 23505. Classify rather
+  // than drop: identical repeats are noise and collapse losslessly, but two rows naming DIFFERENT
+  // captains for one team must never be resolved by picking one — that posts a team's patches to
+  // whichever person happened to sort last.
+  _teamDupCollapsed = 0;
+  _teamDupConflicts = [];
+  const __seen = new Map();
+  const __sig = t => normName([t.team_name, t.captain_name, t.co_captain_name || ''].join('|'));
+  const __deduped = [];
+  for (const t of _teamRows) {
+    const prev = __seen.get(t.team_number);
+    if (!prev) { __seen.set(t.team_number, { row: t, sigs: new Set([__sig(t)]) }); __deduped.push(t); continue; }
+    prev.sigs.add(__sig(t));
+    _teamDupCollapsed++;
+  }
+  for (const [team_number, v] of __seen) {
+    if (v.sigs.size > 1) _teamDupConflicts.push({ team_number, variants: v.sigs.size });
+  }
+  _teamRows = __deduped;
+
   let html = '<span class="stat-badge good">' + _teamRows.length + ' team' + (_teamRows.length === 1 ? '' : 's') + '</span>';
+  if (_teamDupCollapsed) html += '<span class="stat-badge warn">' + _teamDupCollapsed + ' duplicate row'
+    + (_teamDupCollapsed === 1 ? '' : 's') + ' collapsed</span>';
+  if (_teamDupConflicts.length) html += '<span class="stat-badge warn">' + _teamDupConflicts.length
+    + ' team' + (_teamDupConflicts.length === 1 ? '' : 's') + ' with conflicting rows</span>';
   // Show how the captain column was read. A parser that silently reinterprets columns is how a
   // truncated captain name went unnoticed; the operator should be able to see the interpretation.
   html += '<span class="stat-badge">' + esc(mapNote) + '</span>';
@@ -1244,6 +1272,22 @@ async function generateMailingContacts() {
 
   // Match every captain to a player row. Try the team paste's captain in
   // its given form first against both keys. Collect misses for the error UI.
+  // A team listed twice with different captains cannot be saved: the unique constraint allows one row
+  // per team, and choosing between them would be a guess about who receives that team's patches.
+  if (_teamDupConflicts.length) {
+    let dh = '<div class="unmatched-panel">';
+    dh += '<h3>' + _teamDupConflicts.length + ' team' + (_teamDupConflicts.length === 1 ? '' : 's')
+       +  ' listed more than once with different details</h3>';
+    dh += '<p class="hint" style="margin-bottom:8px">Only one mailing contact can exist per team. Identical repeats are collapsed automatically; these differ, so PatchZilla will not choose. Fix the team list and re-paste.</p><ul>';
+    for (const d of _teamDupConflicts) {
+      dh += '<li>Team <strong>' + esc(d.team_number) + '</strong> — <strong>' + d.variants + '</strong> different versions</li>';
+    }
+    dh += '</ul></div>';
+    document.getElementById('unmatchedWrap').innerHTML = dh;
+    setStatus('generateStatus', 'Refused — the same team is listed more than once with different details.', 'err');
+    return;
+  }
+
   const matched = [];
   const unmatched = [];
   const relaxed = [];     // captains matched only after ignoring spacing — disclosed in the UI
