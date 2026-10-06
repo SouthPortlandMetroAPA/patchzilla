@@ -22,7 +22,7 @@ PURPOSE
     - Slip + envelope print layouts preserved 1:1 with the old app.
 
 VERSION
-  APP_VERSION = '2.06'
+  APP_VERSION = '2.07'
 
 DEPLOYMENT
   GitHub Pages   : https://southportlandmetroapa.github.io/<repo>/?op=<slug>
@@ -477,7 +477,7 @@ DEPENDENCIES
         </p>
         <div class="paste-grid">
           <div class="paste-card">
-            <label for="teamPaste">Team list — <em>team#, team name, captain, [co-captain]</em></label>
+            <label for="teamPaste">Team list — <em>team#, team name, captain, [co-captain]</em> <em style="opacity:.7">(or a header row naming first name / last name)</em></label>
             <textarea id="teamPaste" placeholder="5012&#9;Iron Lung&#9;Smith, John&#9;Doe, Jane"></textarea>
             <div class="stats" id="teamStats"></div>
             <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="parseTeamList()">Parse team list</button>
@@ -566,7 +566,7 @@ DEPENDENCIES
    CONSTANTS
    ════════════════════════════════════════════════════════════════════════ */
 const APP_NAME    = 'PatchZilla';
-const APP_VERSION = '2.06';
+const APP_VERSION = '2.07';
 
 const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
 const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
@@ -1095,7 +1095,27 @@ function parseTeamList() {
   }
   let start = 0;
   const firstCols = splitCols(lines[0]);
-  if (looksLikeHeaderRow(firstCols, ['team', 'team#', 'team #', 'team number', 'teams'])) start = 1;
+  // Column map. Defaults are the shape this parser has always assumed; a header row may override them.
+  // Exports differ: some give one Captain cell, others give First Name + Last Name as separate columns,
+  // and reading those positionally stores the first name as the captain and the SURNAME as co-captain.
+  let iCap = 2, iCapLast = -1, iCo = 3, mapNote = 'columns 3 and 4';
+  if (looksLikeHeaderRow(firstCols, ['team', 'team#', 'team #', 'team number', 'teams'])) {
+    start = 1;
+    const h = firstCols.map(c => String(c || '').toLowerCase().trim());
+    const find = names => h.findIndex(c => names.indexOf(c) >= 0);
+    const findCo = () => h.findIndex(c => c.replace(/[^a-z]/g, '').indexOf('cocaptain') >= 0);
+    const iFirst = find(['first name', 'first', 'captain first', 'captain first name']);
+    const iLast  = find(['last name', 'last', 'captain last', 'captain last name']);
+    if (iFirst >= 0 && iLast >= 0) {
+      iCap = iFirst; iCapLast = iLast; iCo = findCo();
+      mapNote = 'captain = "' + firstCols[iFirst] + '" + "' + firstCols[iLast] + '"';
+    } else {
+      const iC = find(['captain', 'captain name']);
+      if (iC >= 0) { iCap = iC; mapNote = 'captain = "' + firstCols[iC] + '"'; }
+      const c2 = findCo();
+      if (c2 >= 0) iCo = c2;
+    }
+  }
 
   let bad = 0;
   for (let i = start; i < lines.length; i++) {
@@ -1103,8 +1123,11 @@ function parseTeamList() {
     if (!cols.length) continue;
     const team_number     = (cols[0] || '').trim();
     const team_name       = (cols[1] || '').trim();
-    const captain_name    = (cols[2] || '').trim();
-    const co_captain_name = (cols[3] || '').trim() || null;
+    // When the header split the captain across two columns, rejoin them. Otherwise read the one cell.
+    const captain_name    = iCapLast >= 0
+      ? ((cols[iCap] || '').trim() + ' ' + (cols[iCapLast] || '').trim()).trim()
+      : (cols[iCap] || '').trim();
+    const co_captain_name = iCo >= 0 ? ((cols[iCo] || '').trim() || null) : null;
     // Require a team number AND a captain name. Anything else → bad row.
     if (!team_number || !captain_name) { bad++; continue; }
     // Normalize team_number — strip leading zeros so "05012" matches "5012".
@@ -1113,6 +1136,9 @@ function parseTeamList() {
     _teamRows.push({ team_number: tnNorm, team_name, captain_name, co_captain_name });
   }
   let html = '<span class="stat-badge good">' + _teamRows.length + ' team' + (_teamRows.length === 1 ? '' : 's') + '</span>';
+  // Show how the captain column was read. A parser that silently reinterprets columns is how a
+  // truncated captain name went unnoticed; the operator should be able to see the interpretation.
+  html += '<span class="stat-badge">' + esc(mapNote) + '</span>';
   if (bad) html += '<span class="stat-badge warn">' + bad + ' skipped (missing team# or captain)</span>';
   document.getElementById('teamStats').innerHTML = html;
   refreshGenerateButton();
